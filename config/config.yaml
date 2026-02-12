@@ -3,7 +3,7 @@
 
 defaults:
   - _self_
-  - run: ???  # Required: specify via command line (e.g., run=proposed-bert-imdb)
+  - run: ???  # Required: specify via command line (e.g., run=comparative-0-qwen-gsm8k)
 
 # Execution mode: main, sanity_check, or pilot
 mode: main

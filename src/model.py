@@ -11,7 +11,7 @@ class LLMGenerator:
     """
     Wrapper for loading and generating with HuggingFace causal LMs.
     """
-    
+
     def __init__(
         self,
         model_name: str,
@@ -21,7 +21,7 @@ class LLMGenerator:
     ):
         """
         Initialize the LLM generator.
-        
+
         Args:
             model_name: HuggingFace model name
             device: Device to load model on
@@ -29,9 +29,15 @@ class LLMGenerator:
             cache_dir: Cache directory for model weights
         """
         self.model_name = model_name
-        self.device = device
         self.cache_dir = cache_dir
-        
+
+        # Check if CUDA is available, fallback to CPU if not
+        if device == "cuda" and not torch.cuda.is_available():
+            print("Warning: CUDA not available, falling back to CPU")
+            device = "cpu"
+
+        self.device = device
+
         # Map dtype string to torch dtype
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -39,14 +45,19 @@ class LLMGenerator:
             "float32": torch.float32,
         }
         self.dtype = dtype_map.get(dtype, torch.bfloat16)
-        
+
+        # Use float32 for CPU (bfloat16 not well supported)
+        if device == "cpu" and self.dtype == torch.bfloat16:
+            print("Note: Using float32 on CPU (bfloat16 not well supported)")
+            self.dtype = torch.float32
+
         print(f"Loading model {model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_name,
             cache_dir=cache_dir,
             trust_remote_code=True,
         )
-        
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=self.dtype,
@@ -54,10 +65,10 @@ class LLMGenerator:
             cache_dir=cache_dir,
             trust_remote_code=True,
         )
-        
+
         self.model.eval()
         print(f"Model loaded successfully on {device}")
-    
+
     def generate(
         self,
         prompt: str,
@@ -67,13 +78,13 @@ class LLMGenerator:
     ) -> str:
         """
         Generate text from a prompt.
-        
+
         Args:
             prompt: Input prompt
             max_new_tokens: Maximum number of tokens to generate
             temperature: Sampling temperature
             do_sample: Whether to use sampling
-        
+
         Returns:
             Generated text
         """
@@ -87,7 +98,7 @@ class LLMGenerator:
             )
         else:
             formatted_prompt = prompt
-        
+
         # Tokenize
         inputs = self.tokenizer(
             formatted_prompt,
@@ -95,7 +106,7 @@ class LLMGenerator:
             truncation=True,
             max_length=2048,
         ).to(self.device)
-        
+
         # Generate
         with torch.no_grad():
             outputs = self.model.generate(
@@ -105,11 +116,11 @@ class LLMGenerator:
                 do_sample=do_sample,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
-        
+
         # Decode (only the generated part)
         generated_text = self.tokenizer.decode(
-            outputs[0][inputs["input_ids"].shape[1]:],
+            outputs[0][inputs["input_ids"].shape[1] :],
             skip_special_tokens=True,
         )
-        
+
         return generated_text
