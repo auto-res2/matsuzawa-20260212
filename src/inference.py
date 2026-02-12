@@ -28,46 +28,48 @@ Question: {question}
 
 Think step by step and end with your final answer."""
 
-ET_COT_PROMPT = """Solve this math problem step by step using this format:
+ET_COT_PROMPT = """Solve this math problem using exactly this format:
 
 VARS: {{"a": 3, "b": 2}}
 TRACE:
 c = a + b
 FINAL: 5
 
-Rules:
-1. VARS: JSON with numbers only
-2. TRACE: Only "variable = math" lines
-3. FINAL: Must equal the last variable in TRACE
+IMPORTANT RULES:
+1. VARS must be valid JSON with only numbers
+2. TRACE must have only math lines (variable = expression)
+3. FINAL must exactly equal the last variable you computed in TRACE
 
-Example 1:
+Example 1 - Janet's eggs problem:
 Question: Janet has 16 eggs. She eats 3 and bakes 4. She sells the rest for $2 each. How much money?
 
 VARS: {{"eggs": 16, "eaten": 3, "baked": 4, "price": 2}}
 TRACE:
 used = eaten + baked
 left = eggs - used
-answer = left * price
+money = left * price
 FINAL: 18
 
-Example 2:
+Example 2 - Simple subtraction:
 Question: A store has 80 apples and sells 25. How many left?
 
 VARS: {{"start": 80, "sold": 25}}
 TRACE:
-answer = start - sold
+left = start - sold
 FINAL: 55
 
-Example 3:
+Example 3 - Simple multiplication:
 Question: Bob drives 3 hours at 60 mph. How many miles?
 
 VARS: {{"hours": 3, "speed": 60}}
 TRACE:
-answer = hours * speed
+distance = hours * speed
 FINAL: 180
 
-Now solve (FINAL must equal last TRACE variable):
-Question: {question}"""
+Now solve this problem. Make sure FINAL equals the last variable in your TRACE:
+Question: {question}
+
+VARS:"""
 
 ET_COT_REPAIR_PROMPT = """ERROR: {error_message}
 
@@ -371,6 +373,7 @@ def verify_et_cot_trace(
         # Track which variables were defined to identify the last computed one
         initial_var_names = set(namespace.keys())
         last_computed_var = None
+        computed_vars_order = []  # Track order of computed variables
 
         # Execute trace line by line (only simple arithmetic)
         for line in trace_code.split("\n"):
@@ -420,8 +423,9 @@ def verify_et_cot_trace(
                     result = eval(expr_cleaned, {"__builtins__": {}}, namespace)
                     namespace[var_name] = float(result)
                     
-                    # Track last computed variable (not from VARS)
+                    # Track computed variables (not from initial VARS) in order
                     if var_name not in initial_var_names:
+                        computed_vars_order.append(var_name)
                         last_computed_var = var_name
                 except Exception as e:
                     # Provide more helpful error message but continue trying other lines
@@ -429,25 +433,34 @@ def verify_et_cot_trace(
                     continue
 
         # Get last computed value
-        # Prefer the last computed variable (not from initial VARS)
-        if last_computed_var:
+        # Use the LAST computed variable (most recent in execution order)
+        if computed_vars_order:
+            last_computed_var = computed_vars_order[-1]
+            last_computed_value = namespace[last_computed_var]
+        elif last_computed_var:
+            # Fallback to tracked variable (shouldn't happen with new logic)
             last_computed_value = namespace[last_computed_var]
         elif namespace:
-            # Fallback: use last variable in namespace
+            # Last fallback: use last variable in namespace
             last_var_name = list(namespace.keys())[-1]
             last_computed_value = namespace[last_var_name]
         else:
             return False, "No variables computed in trace", None
 
         # Unit test 1: FINAL matches last computed value (within tolerance)
-        # If mismatch, we'll use the computed value (trace is more reliable)
+        # If mismatch, provide the computed value but mark as verification failed
         final_mismatch = abs(last_computed_value - final_answer) > 1e-6
         if final_mismatch:
+            # Check if trace looks complete (has at least 2 computed variables)
+            # If trace looks incomplete, the corrected answer is less trustworthy
+            trace_looks_complete = len(computed_vars_order) >= 2
+            
             # Return False for verification but provide the corrected answer
+            # The caller can decide whether to use it based on context
             return (
                 False,
-                f"FINAL ({final_answer}) does not match last computed value ({last_computed_value})",
-                last_computed_value,  # Use computed value as the answer
+                f"FINAL ({final_answer}) != last computed ({last_computed_value}){' [trace may be incomplete]' if not trace_looks_complete else ''}",
+                last_computed_value,  # Provide computed value
             )
 
         # Unit test 2: No NaN/Inf
@@ -561,10 +574,8 @@ def run_inference(cfg: Dict) -> None:
                         vars_dict, trace_code, predicted_answer, question
                     )
                     
-                    # Use corrected answer from trace if verification found a mismatch
-                    if not verification_passed and corrected_answer is not None:
-                        print(f"  Example {i}: Using computed value {corrected_answer} instead of FINAL {predicted_answer}")
-                        predicted_answer = corrected_answer
+                    # If verification passed, trust the FINAL value (model was consistent)
+                    # If verification failed but we have a corrected_answer, store it for potential use
                 else:
                     # Missing components - set error message
                     missing = []
@@ -576,6 +587,7 @@ def run_inference(cfg: Dict) -> None:
                         missing.append("FINAL")
                     error_message = f"Missing required components: {', '.join(missing)}"
                     verification_passed = False
+                    corrected_answer = None
 
                 # Repair attempt if verification failed
                 if not verification_passed and max_retries > 0:
@@ -587,7 +599,7 @@ def run_inference(cfg: Dict) -> None:
                     repair_response = generator.generate(
                         repair_prompt,
                         max_new_tokens=cfg["model"]["max_new_tokens"],
-                        temperature=max(0.1, cfg["model"]["temperature"] * 0.5),  # Lower temp for repair
+                        temperature=cfg["model"]["temperature"],  # Use same temperature as initial generation
                         do_sample=cfg["model"]["do_sample"],
                     )
 
@@ -596,21 +608,26 @@ def run_inference(cfg: Dict) -> None:
                         repair_response
                     )
                     
-                    # Only use repaired response if it's better
+                    # Verify repaired response if we have all components
                     if vars_dict_repaired is not None and trace_code_repaired is not None and predicted_answer_repaired is not None:
                         verification_passed_repaired, error_message_repaired, corrected_answer_repaired = verify_et_cot_trace(
                             vars_dict_repaired, trace_code_repaired, predicted_answer_repaired, question
                         )
                         
-                        if verification_passed_repaired or predicted_answer is None:
-                            # Use repaired response if it passed verification or original had no answer
+                        # Use repaired response if it passed verification OR if original had no answer
+                        if verification_passed_repaired:
+                            # Repair succeeded - use repaired response
+                            verification_passed = True
+                            error_message = None
+                            predicted_answer = predicted_answer_repaired
+                            vars_dict, trace_code = vars_dict_repaired, trace_code_repaired
+                        elif predicted_answer is None and predicted_answer_repaired is not None:
+                            # Original had no answer, use repaired even if not verified
                             verification_passed = verification_passed_repaired
                             error_message = error_message_repaired
-                            vars_dict, trace_code, predicted_answer = vars_dict_repaired, trace_code_repaired, predicted_answer_repaired
-                            
-                            # Use corrected answer from repair if available
-                            if not verification_passed_repaired and corrected_answer_repaired is not None:
-                                predicted_answer = corrected_answer_repaired
+                            predicted_answer = predicted_answer_repaired
+                            vars_dict, trace_code = vars_dict_repaired, trace_code_repaired
+                        # Otherwise keep the original response (don't make it worse)
             else:
                 verification_passed = True
             

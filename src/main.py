@@ -23,10 +23,10 @@ def main(cfg: DictConfig) -> None:
         if "sanity" not in cfg.wandb.project:
             cfg.wandb.project = f"{cfg.wandb.project}-sanity"
         # Lower temperature for more consistent formatting in sanity checks
-        # For structured output formats like ET-CoT, use very low temperature
+        # For structured output formats like ET-CoT, use greedy decoding
         if cfg.run.method == "et_cot":
-            cfg.model.temperature = 0.1
-            cfg.model.do_sample = True
+            cfg.model.temperature = 0.0  # Greedy decoding for maximum consistency
+            cfg.model.do_sample = False
         elif cfg.model.temperature > 0.3:
             cfg.model.temperature = 0.3
     

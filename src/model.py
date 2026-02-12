@@ -109,12 +109,21 @@ class LLMGenerator:
 
         # Generate
         with torch.no_grad():
+            # Prepare generation kwargs
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": do_sample,
+                "pad_token_id": self.tokenizer.eos_token_id,
+            }
+            
+            # Only add temperature if sampling is enabled
+            # (temperature is ignored for greedy decoding)
+            if do_sample and temperature > 0:
+                gen_kwargs["temperature"] = temperature
+            
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                pad_token_id=self.tokenizer.eos_token_id,
+                **gen_kwargs,
             )
 
         # Decode (only the generated part)
