@@ -28,76 +28,57 @@ Question: {question}
 
 Think step by step and end with your final answer."""
 
-ET_COT_PROMPT = """Solve this math problem. You MUST provide your answer in this EXACT format:
+ET_COT_PROMPT = """Solve this math problem step by step using this format:
 
-VARS: {{"key1": number1, "key2": number2}}
+VARS: {{"a": 3, "b": 2}}
 TRACE:
-var3 = var1 + var2
-var4 = var3 * 2
-FINAL: number
-
-CRITICAL RULES - Follow these exactly:
-1. VARS must be valid JSON with double quotes around keys and ONLY pure numbers as values (like 5, 3.14, 100)
-2. TRACE must contain ONLY Python assignment statements (varname = expression)
-3. TRACE expressions can ONLY use: numbers, +, -, *, /, (), and variable names from VARS or previous TRACE lines
-4. NO text, NO descriptions, NO double equals (==), NO colons in TRACE - ONLY "varname = expression" format
-5. FINAL must be a single number
-
-Example 1:
-Question: Sarah has 3 apples. She buys 2 more. How many does she have?
-
-VARS: {{"initial": 3, "bought": 2}}
-TRACE:
-total = initial + bought
+c = a + b
 FINAL: 5
 
-Example 2:
-Question: A box costs $10 and there is a 20% discount. What is the final price?
+Rules:
+1. VARS: JSON with numbers only
+2. TRACE: Only "variable = math" lines
+3. FINAL: Must equal the last variable in TRACE
 
-VARS: {{"price": 10, "discount_rate": 0.2}}
+Example 1:
+Question: Janet has 16 eggs. She eats 3 and bakes 4. She sells the rest for $2 each. How much money?
+
+VARS: {{"eggs": 16, "eaten": 3, "baked": 4, "price": 2}}
 TRACE:
-discount = price * discount_rate
-final_price = price - discount
-FINAL: 8
-
-Example 3:
-Question: Janet has 16 eggs. She eats 3 and bakes with 4. She sells the rest for $2 each. How much does she make?
-
-VARS: {{"eggs_total": 16, "eggs_eaten": 3, "eggs_baked": 4, "price_per_egg": 2}}
-TRACE:
-eggs_used = eggs_eaten + eggs_baked
-eggs_left = eggs_total - eggs_used
-money = eggs_left * price_per_egg
+used = eaten + baked
+left = eggs - used
+answer = left * price
 FINAL: 18
 
-Now solve this problem. Remember: VARS must be valid JSON, TRACE must be ONLY "var = expression" lines with NO text or explanations:
+Example 2:
+Question: A store has 80 apples and sells 25. How many left?
 
-Question: {question}
-
-Your answer:"""
-
-ET_COT_REPAIR_PROMPT = """Your previous answer failed verification: {error_message}
-
-Please provide a complete corrected solution. Follow this EXACT format:
-
-VARS: {{"key1": number1, "key2": number2}}
+VARS: {{"start": 80, "sold": 25}}
 TRACE:
-var3 = key1 + key2
-var4 = var3 * 10
-FINAL: number
+answer = start - sold
+FINAL: 55
 
-CRITICAL - Common mistakes to avoid:
-1. VARS must have double quotes around keys: {{"price": 10}} NOT {{price: 10}}
-2. VARS values must be ONLY pure numbers: {{"x": 5}} NOT {{"x": 3 + 2}}
-3. TRACE lines must be ONLY "varname = expression" - NO text, NO descriptions, NO double equals
-4. Do NOT write: "eggs_left = 16 - 7 = 9" - Write: "eggs_left = 16 - 7"
-5. Do NOT include units or text after expressions: "total = 10 cups" - Write: "total = 10"
-6. Use only variables from VARS or previous TRACE lines in your expressions
-7. FINAL must match the last computed value
+Example 3:
+Question: Bob drives 3 hours at 60 mph. How many miles?
+
+VARS: {{"hours": 3, "speed": 60}}
+TRACE:
+answer = hours * speed
+FINAL: 180
+
+Now solve (FINAL must equal last TRACE variable):
+Question: {question}"""
+
+ET_COT_REPAIR_PROMPT = """ERROR: {error_message}
+
+Fix your answer. Remember:
+- VARS must be valid JSON: {{"a": 5, "b": 3}}
+- TRACE must be only "var = math" lines (no text!)
+- FINAL must equal the LAST variable in TRACE
 
 Question: {question}
 
-Your corrected answer (remember: JSON VARS with double quotes, clean TRACE with only "var = expr" format):"""
+Corrected answer:"""
 
 
 def extract_number_from_text(text: str) -> Optional[float]:
@@ -355,12 +336,13 @@ def parse_et_cot_response(
 
 def verify_et_cot_trace(
     vars_dict: Dict, trace_code: str, final_answer: float, question: str
-) -> Tuple[bool, Optional[str]]:
+) -> Tuple[bool, Optional[str], Optional[float]]:
     """
     Deterministically verify ET-CoT trace by executing it.
 
     Returns:
-        (is_valid, error_message)
+        (is_valid, error_message, corrected_answer)
+        - corrected_answer is the last computed value from trace (use if FINAL doesn't match)
     """
     # Check for None explicitly since empty dict/string are also falsy
     if vars_dict is None or trace_code is None or final_answer is None:
@@ -371,10 +353,10 @@ def verify_et_cot_trace(
             missing.append("TRACE")
         if final_answer is None:
             missing.append("FINAL")
-        return False, f"Missing required components: {', '.join(missing)}"
+        return False, f"Missing required components: {', '.join(missing)}", None
     
     if not vars_dict or not trace_code:
-        return False, "Empty VARS or TRACE (model may not be following format)"
+        return False, "Empty VARS or TRACE (model may not be following format)", None
 
     try:
         # Create execution namespace with initial variables
@@ -384,7 +366,7 @@ def verify_et_cot_trace(
             try:
                 namespace[k] = float(v)
             except (ValueError, TypeError):
-                return False, f"VARS entry '{k}' has non-numeric value: {v}"
+                return False, f"VARS entry '{k}' has non-numeric value: {v}", None
 
         # Track which variables were defined to identify the last computed one
         initial_var_names = set(namespace.keys())
@@ -455,36 +437,40 @@ def verify_et_cot_trace(
             last_var_name = list(namespace.keys())[-1]
             last_computed_value = namespace[last_var_name]
         else:
-            return False, "No variables computed in trace"
+            return False, "No variables computed in trace", None
 
         # Unit test 1: FINAL matches last computed value (within tolerance)
-        if abs(last_computed_value - final_answer) > 1e-6:
+        # If mismatch, we'll use the computed value (trace is more reliable)
+        final_mismatch = abs(last_computed_value - final_answer) > 1e-6
+        if final_mismatch:
+            # Return False for verification but provide the corrected answer
             return (
                 False,
                 f"FINAL ({final_answer}) does not match last computed value ({last_computed_value})",
+                last_computed_value,  # Use computed value as the answer
             )
 
         # Unit test 2: No NaN/Inf
         for var_name, value in namespace.items():
             if not isinstance(value, (int, float)) or not (-1e10 < value < 1e10):
-                return False, f"Invalid value for {var_name}: {value}"
+                return False, f"Invalid value for {var_name}: {value}", None
 
         # Unit test 3: Constraint checks (integer/nonnegative when question suggests counting)
         counting_keywords = ["how many", "total", "left", "count", "number of"]
         if any(keyword in question.lower() for keyword in counting_keywords):
             # Should be non-negative
-            if final_answer < 0:
-                return False, f"Negative answer ({final_answer}) for counting question"
+            if last_computed_value < 0:
+                return False, f"Negative answer ({last_computed_value}) for counting question", None
 
             # Optionally check if should be integer (with small tolerance)
-            if abs(final_answer - round(final_answer)) > 0.01:
+            if abs(last_computed_value - round(last_computed_value)) > 0.01:
                 # Allow non-integers (e.g., averages), but warn
                 pass
 
-        return True, None
+        return True, None, last_computed_value
 
     except Exception as e:
-        return False, f"Trace execution failed: {str(e)}"
+        return False, f"Trace execution failed: {str(e)}", None
 
 
 def run_inference(cfg: Dict) -> None:
@@ -566,13 +552,19 @@ def run_inference(cfg: Dict) -> None:
             # Verify trace
             verification_passed = False
             error_message = None
+            corrected_answer = None
 
             if cfg["inference"].get("verification", {}).get("enabled", False):
                 # Only verify if we have all components
                 if vars_dict is not None and trace_code is not None and predicted_answer is not None:
-                    verification_passed, error_message = verify_et_cot_trace(
+                    verification_passed, error_message, corrected_answer = verify_et_cot_trace(
                         vars_dict, trace_code, predicted_answer, question
                     )
+                    
+                    # Use corrected answer from trace if verification found a mismatch
+                    if not verification_passed and corrected_answer is not None:
+                        print(f"  Example {i}: Using computed value {corrected_answer} instead of FINAL {predicted_answer}")
+                        predicted_answer = corrected_answer
                 else:
                     # Missing components - set error message
                     missing = []
@@ -606,13 +598,19 @@ def run_inference(cfg: Dict) -> None:
                     
                     # Only use repaired response if it's better
                     if vars_dict_repaired is not None and trace_code_repaired is not None and predicted_answer_repaired is not None:
-                        verification_passed, error_message = verify_et_cot_trace(
+                        verification_passed_repaired, error_message_repaired, corrected_answer_repaired = verify_et_cot_trace(
                             vars_dict_repaired, trace_code_repaired, predicted_answer_repaired, question
                         )
                         
-                        if verification_passed or predicted_answer is None:
+                        if verification_passed_repaired or predicted_answer is None:
                             # Use repaired response if it passed verification or original had no answer
+                            verification_passed = verification_passed_repaired
+                            error_message = error_message_repaired
                             vars_dict, trace_code, predicted_answer = vars_dict_repaired, trace_code_repaired, predicted_answer_repaired
+                            
+                            # Use corrected answer from repair if available
+                            if not verification_passed_repaired and corrected_answer_repaired is not None:
+                                predicted_answer = corrected_answer_repaired
             else:
                 verification_passed = True
             
