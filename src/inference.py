@@ -104,10 +104,51 @@ def parse_et_cot_response(
     final_answer = None
 
     try:
-        # Extract VARS
-        vars_match = re.search(r"VARS:\s*(\{[^}]+\})", response, re.IGNORECASE)
-        if vars_match:
-            vars_dict = json.loads(vars_match.group(1))
+        # Extract VARS - find JSON object after VARS: (handling nested braces and multiline)
+        vars_start = re.search(r"VARS:\s*", response, re.IGNORECASE)
+        if vars_start:
+            # Start from position after "VARS:"
+            json_start_pos = vars_start.end()
+            remaining = response[json_start_pos:]
+            
+            # Skip whitespace (including newlines)
+            remaining = remaining.lstrip()
+            
+            if remaining.startswith('{'):
+                # Find the complete JSON object by counting braces
+                brace_count = 0
+                json_end = 0
+                in_string = False
+                escape_next = False
+                
+                for i, char in enumerate(remaining):
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    
+                    if char == '\\':
+                        escape_next = True
+                        continue
+                    
+                    if char == '"' and not escape_next:
+                        in_string = not in_string
+                    
+                    if not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                json_end = i + 1
+                                break
+                
+                if json_end > 0:
+                    vars_json = remaining[:json_end]
+                    try:
+                        vars_dict = json.loads(vars_json)
+                    except json.JSONDecodeError as je:
+                        print(f"Warning: Failed to parse VARS JSON: {je}")
+                        print(f"  Attempted to parse: {vars_json[:200]}")
 
         # Extract TRACE
         trace_match = re.search(
@@ -125,6 +166,7 @@ def parse_et_cot_response(
 
     except Exception as e:
         print(f"Warning: Failed to parse ET-CoT response: {e}")
+        print(f"  Response preview: {response[:300]}")
 
     return vars_dict, trace_code, final_answer
 
@@ -302,6 +344,10 @@ def run_inference(cfg: Dict) -> None:
                     )
             else:
                 verification_passed = True
+            
+            # Fallback: if structured parsing completely failed, try to extract any number
+            if predicted_answer is None:
+                predicted_answer = extract_number_from_text(response)
 
         else:
             raise ValueError(f"Unknown prompt type: {prompt_type}")
