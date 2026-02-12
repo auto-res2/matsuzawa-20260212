@@ -181,78 +181,22 @@ def parse_et_cot_response(
                         vars_dict = json.loads(vars_json)
                     except json.JSONDecodeError as je:
                         print(f"Warning: Failed to parse VARS JSON: {je}")
-                        print(f"  Attempted to parse: {vars_json[:200]}")
                         
-                        # Try to fix common issues: expressions in JSON values or string values
-                        # The model often puts:
-                        # 1. Arithmetic expressions like "3 * 60" or "150 / 100" in JSON
-                        # 2. String values that should be numbers
-                        # 3. Missing quotes around strings
+                        # Try to fix common issues: single quotes, expressions in JSON values
+                        # The model often outputs Python dict syntax instead of JSON
                         try:
-                            # Replace null/bool literals with Python equivalents
-                            python_dict_str = vars_json.replace('null', 'None').replace('true', 'True').replace('false', 'False')
-                            
-                            # Try to extract key-value pairs manually if JSON parsing failed
-                            # This handles cases where values are expressions or have syntax issues
-                            manual_dict = {}
-                            
-                            # Pattern to match key-value pairs (handles expressions, strings, numbers)
-                            kv_pattern = r'["\']?(\w+)["\']?\s*:\s*([^,}\n]+)'
-                            matches = re.findall(kv_pattern, vars_json)
-                            
-                            if matches:
-                                for key, value_str in matches:
-                                    value_str = value_str.strip().strip('"\'')
-                                    try:
-                                        # Try to evaluate as a number or expression
-                                        # Use a safe namespace with only arithmetic operations
-                                        safe_namespace = {
-                                            "__builtins__": {},
-                                            "abs": abs,
-                                            "int": int,
-                                            "float": float,
-                                        }
-                                        
-                                        # Evaluate the value (handles expressions like "3 * 60")
-                                        evaluated_value = eval(value_str, safe_namespace, {})
-                                        
-                                        # Convert to float
-                                        if isinstance(evaluated_value, (int, float)):
-                                            manual_dict[key] = float(evaluated_value)
-                                        else:
-                                            manual_dict[key] = float(evaluated_value)
-                                    except:
-                                        # If evaluation fails, try direct float conversion
-                                        try:
-                                            manual_dict[key] = float(value_str)
-                                        except:
-                                            # Skip entries that can't be converted
-                                            print(f"  Warning: Skipping VARS entry '{key}': {value_str}")
-                                            continue
-                                
-                                if manual_dict:
-                                    vars_dict = manual_dict
-                                    print(f"  Successfully parsed VARS manually ({len(vars_dict)} entries)")
-                            
-                            # Fallback: Try Python eval with full dict string
-                            if not vars_dict:
+                            # First, try to convert single quotes to double quotes for JSON compatibility
+                            # This is a common issue when the model outputs Python dict syntax
+                            json_fixed = vars_json.replace("'", '"')
+                            try:
+                                vars_dict = json.loads(json_fixed)
+                                print(f"  Successfully parsed VARS after fixing quotes ({len(vars_dict)} entries)")
+                            except json.JSONDecodeError:
+                                # If still fails, try Python literal_eval (handles Python dict syntax)
                                 try:
-                                    safe_namespace = {
-                                        "__builtins__": {},
-                                        "abs": abs,
-                                        "int": int,
-                                        "float": float,
-                                    }
-                                    
-                                    # Try literal_eval first (safest)
-                                    try:
-                                        evaluated_dict = ast.literal_eval(python_dict_str)
-                                    except:
-                                        # Then try eval with restricted namespace
-                                        evaluated_dict = eval(python_dict_str, safe_namespace, {})
-                                    
-                                    # Convert all values to float
+                                    evaluated_dict = ast.literal_eval(vars_json)
                                     if isinstance(evaluated_dict, dict):
+                                        # Convert all values to float
                                         vars_dict = {}
                                         for k, v in evaluated_dict.items():
                                             try:
@@ -261,15 +205,57 @@ def parse_et_cot_response(
                                                 elif v is None:
                                                     vars_dict[k] = 0.0
                                                 else:
-                                                    vars_dict[k] = float(v)
-                                            except:
-                                                print(f"  Warning: Skipping VARS entry '{k}': {v}")
+                                                    # Try to evaluate expressions
+                                                    safe_namespace = {
+                                                        "__builtins__": {},
+                                                        "abs": abs,
+                                                        "int": int,
+                                                        "float": float,
+                                                    }
+                                                    evaluated_value = eval(str(v), safe_namespace, {})
+                                                    vars_dict[k] = float(evaluated_value)
+                                            except Exception as conv_error:
+                                                print(f"  Warning: Skipping VARS entry '{k}': {v} ({conv_error})")
                                                 continue
                                         
                                         if vars_dict:
-                                            print(f"  Successfully parsed VARS with eval ({len(vars_dict)} entries)")
-                                except Exception as eval_error:
-                                    print(f"  Failed to evaluate VARS dict: {eval_error}")
+                                            print(f"  Successfully parsed VARS with literal_eval ({len(vars_dict)} entries)")
+                                except Exception as literal_error:
+                                    # Last resort: manual regex-based parsing
+                                    print(f"  literal_eval failed: {literal_error}")
+                                    manual_dict = {}
+                                    
+                                    # Pattern to match key-value pairs with optional quotes
+                                    # Handles: "key": value, 'key': value, key: value
+                                    kv_pattern = r'''['"']?(\w+)['"']?\s*:\s*([^,}\n]+)'''
+                                    matches = re.findall(kv_pattern, vars_json)
+                                    
+                                    if matches:
+                                        for key, value_str in matches:
+                                            value_str = value_str.strip().strip('"\'')
+                                            try:
+                                                # Try to evaluate as a number or expression
+                                                safe_namespace = {
+                                                    "__builtins__": {},
+                                                    "abs": abs,
+                                                    "int": int,
+                                                    "float": float,
+                                                }
+                                                
+                                                # Evaluate the value (handles expressions like "3 * 60")
+                                                evaluated_value = eval(value_str, safe_namespace, {})
+                                                manual_dict[key] = float(evaluated_value)
+                                            except:
+                                                # If evaluation fails, try direct float conversion
+                                                try:
+                                                    manual_dict[key] = float(value_str)
+                                                except:
+                                                    print(f"  Warning: Skipping VARS entry '{key}': {value_str}")
+                                                    continue
+                                        
+                                        if manual_dict:
+                                            vars_dict = manual_dict
+                                            print(f"  Successfully parsed VARS manually ({len(vars_dict)} entries)")
                         except Exception as fix_error:
                             print(f"  Failed to fix VARS: {fix_error}")
 
