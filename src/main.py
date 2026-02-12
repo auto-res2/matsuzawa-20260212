@@ -22,6 +22,9 @@ def main(cfg: DictConfig) -> None:
         # Use sanity WandB namespace
         if "sanity" not in cfg.wandb.project:
             cfg.wandb.project = f"{cfg.wandb.project}-sanity"
+        # Lower temperature slightly for more consistent formatting in sanity checks
+        if cfg.model.temperature > 0.3:
+            cfg.model.temperature = 0.3
     
     # Print configuration
     print("=" * 80)

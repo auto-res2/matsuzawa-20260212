@@ -28,36 +28,45 @@ Question: {question}
 
 Think step by step and end with your final answer."""
 
-ET_COT_PROMPT = """Solve the math problem step-by-step. Format your answer EXACTLY like the examples below.
+ET_COT_PROMPT = """Solve this math problem using the exact format shown below. Your answer must have three sections: VARS (a JSON dictionary), TRACE (Python-like arithmetic steps), and FINAL (the numeric answer).
 
-Example 1:
+Example format:
+
 Question: Sarah has 3 apples. She buys 2 more. How many does she have?
+Answer:
 VARS: {{"initial": 3, "bought": 2}}
 TRACE:
 total = initial + bought
 FINAL: 5
 
-Example 2:
 Question: A box costs $10 and there is a 20% discount. What is the final price?
+Answer:
 VARS: {{"price": 10, "discount_rate": 0.2}}
 TRACE:
 discount = price * discount_rate
 final_price = price - discount
 FINAL: 8
 
-Now solve this problem using the same format (VARS, TRACE, FINAL):
-Question: {question}"""
+Now solve this problem following the exact same format:
+
+Question: {question}
+Answer:"""
 
 ET_COT_REPAIR_PROMPT = """The previous answer had an error: {error_message}
 
-Provide a corrected solution in this format:
+You MUST provide a corrected solution with all three required sections.
+
+Format requirements:
 VARS: {{"var1": value, "var2": value}}
 TRACE:
 step1 = var1 + var2
-FINAL: answer
+step2 = step1 * 3
+FINAL: answer_number
 
 Question: {question}
-Corrected solution:"""
+
+Corrected solution:
+VARS:"""
 
 
 def extract_number_from_text(text: str) -> Optional[float]:
@@ -109,9 +118,11 @@ def parse_et_cot_response(
     try:
         # Extract VARS - find JSON object after VARS: (handling nested braces and multiline)
         # Try multiple patterns to be flexible
-        vars_start = re.search(r"VARS:\s*", response, re.IGNORECASE)
+        vars_start = re.search(r"VARS\s*:\s*", response, re.IGNORECASE)
         if not vars_start:
-            # Try without colon
+            # Try without colon or with newline
+            vars_start = re.search(r"VARS\s*\n\s*", response, re.IGNORECASE)
+        if not vars_start:
             vars_start = re.search(r"VARS\s+", response, re.IGNORECASE)
         
         if vars_start:
@@ -122,6 +133,7 @@ def parse_et_cot_response(
             # Skip whitespace (including newlines)
             remaining = remaining.lstrip()
             
+            # Look for opening brace (may be on next line or after whitespace)
             if remaining.startswith('{'):
                 # Find the complete JSON object by counting braces
                 brace_count = 0
@@ -252,10 +264,18 @@ def parse_et_cot_response(
                 pass
     
     if not trace_code:
-        # Look for assignment-like patterns
-        assignments = re.findall(r'^\s*(\w+)\s*=\s*(.+)$', response, re.MULTILINE)
+        # Look for assignment-like patterns anywhere in response
+        assignments = re.findall(r'^\s*(\w+)\s*=\s*(.+?)(?:\n|$)', response, re.MULTILINE)
         if assignments:
-            trace_code = '\n'.join(f"{var} = {expr}" for var, expr in assignments)
+            # Filter out assignments that don't look like arithmetic
+            valid_assignments = []
+            for var, expr in assignments:
+                expr = expr.strip()
+                # Keep if it looks like arithmetic (contains numbers, +, -, *, /, or known vars)
+                if re.search(r'[\d+\-*/()]', expr):
+                    valid_assignments.append(f"{var} = {expr}")
+            if valid_assignments:
+                trace_code = '\n'.join(valid_assignments)
     
     if final_answer is None:
         # Try to find ANY number in the response as last resort
@@ -416,10 +436,10 @@ def run_inference(cfg: Dict) -> None:
             # Parse response
             vars_dict, trace_code, predicted_answer = parse_et_cot_response(response)
             
-            # Debug: print parsing results for first example
-            if i == 0:
-                print(f"\n  [DEBUG] First example response preview: {response[:300]}")
-                print(f"  [DEBUG] Parsed - VARS: {vars_dict}, TRACE: {trace_code[:50] if trace_code else None}, FINAL: {predicted_answer}")
+            # Debug: print parsing results for first few examples
+            if i < 3:
+                print(f"\n  [DEBUG] Example {i} response: {response[:400]}")
+                print(f"  [DEBUG] Parsed - VARS: {vars_dict}, TRACE: {trace_code[:100] if trace_code else None}, FINAL: {predicted_answer}")
 
             # Verify trace
             verification_passed = False
