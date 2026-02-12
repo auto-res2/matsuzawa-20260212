@@ -12,6 +12,6 @@ results_dir: .research/results
 
 # WandB configuration (will be set by AI agent)
 wandb:
-  entity: ???
-  project: ???
+  entity: airas
+  project: 2026-02-12
   mode: online

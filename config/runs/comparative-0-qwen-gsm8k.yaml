@@ -1,0 +1,26 @@
+# @package _global_
+
+# Baseline: Standard Chain-of-Thought
+run:
+  run_id: comparative-0-qwen-gsm8k
+  method: cot_baseline
+  description: "Standard CoT prompting baseline with free-form step-by-step reasoning"
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  device: cuda
+  dtype: bfloat16
+  max_new_tokens: 256
+  temperature: 0.7
+  do_sample: true
+
+dataset:
+  name: gsm8k
+  split: test
+  max_samples: 200
+  cache_dir: .cache
+
+inference:
+  prompt_type: cot_baseline
+  max_retries: 0
+  extract_numeric_answer: true

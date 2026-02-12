@@ -1,0 +1,32 @@
+# @package _global_
+
+# Proposed: Executable-Trace Chain-of-Thought with Deterministic Unit Tests (ET-CoT)
+run:
+  run_id: proposed-qwen-gsm8k
+  method: et_cot
+  description: "ET-CoT: Structured executable trace with deterministic verification and targeted repair"
+
+model:
+  name: Qwen/Qwen2.5-1.5B-Instruct
+  device: cuda
+  dtype: bfloat16
+  max_new_tokens: 256
+  temperature: 0.7
+  do_sample: true
+
+dataset:
+  name: gsm8k
+  split: test
+  max_samples: 200
+  cache_dir: .cache
+
+inference:
+  prompt_type: et_cot
+  max_retries: 1  # One repair attempt if verification fails
+  extract_numeric_answer: true
+  verification:
+    enabled: true
+    unit_tests:
+      - final_matches_last_var
+      - no_nan_inf
+      - constraint_checks  # Integer/nonnegativity when question suggests counting
