@@ -6,6 +6,7 @@ Supports CoT baseline and ET-CoT with deterministic verification.
 import sys
 import json
 import re
+import ast
 import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -28,17 +29,19 @@ Question: {question}
 Think step by step and end with your final answer."""
 
 ET_COT_PROMPT = """Solve this math word problem using a structured format. You must output:
-1. VARS: A JSON dictionary of named intermediate quantities (numbers only)
+1. VARS: A JSON dictionary of named intermediate quantities (ONLY literal numbers, NO expressions or calculations)
 2. TRACE: Python-like assignments using only numbers and previously defined variables
 3. FINAL: The final numeric answer
 
 Format your response exactly like this:
-VARS: {{"var1": value1, "var2": value2, ...}}
+VARS: {{"var1": 5, "var2": 10}}
 TRACE:
 result1 = var1 + var2
 result2 = result1 * 3
-...
 FINAL: <number>
+
+IMPORTANT: In VARS, use ONLY literal numbers like 5, 10.5, -3. Do NOT use expressions like 3*60 or 150/100.
+Put all calculations in the TRACE section instead.
 
 Question: {question}
 
@@ -47,10 +50,13 @@ Provide your structured solution:"""
 ET_COT_REPAIR_PROMPT = """Your previous solution failed verification: {error_message}
 
 Please provide a CORRECTED solution in the same structured format:
-VARS: {{...}}
+VARS: {{...}}  (use ONLY literal numbers, NO expressions or variable references)
 TRACE:
 ...
 FINAL: <number>
+
+Remember: VARS must contain only literal numbers like 5, 10.5, -3.
+All calculations must go in the TRACE section.
 
 Question: {question}
 
@@ -149,6 +155,55 @@ def parse_et_cot_response(
                     except json.JSONDecodeError as je:
                         print(f"Warning: Failed to parse VARS JSON: {je}")
                         print(f"  Attempted to parse: {vars_json[:200]}")
+                        
+                        # Try to fix common issues: expressions in JSON values
+                        # The model often puts arithmetic expressions like "3 * 60" or "150 / 100" in JSON
+                        # We need to evaluate these expressions to get valid JSON
+                        try:
+                            # Replace null with None for Python parsing
+                            python_dict_str = vars_json.replace('null', 'None').replace('true', 'True').replace('false', 'False')
+                            
+                            # Use eval with restricted namespace to safely evaluate the dict with expressions
+                            # This allows arithmetic but blocks dangerous operations
+                            safe_dict = {}
+                            safe_namespace = {
+                                "__builtins__": {},
+                                "abs": abs,
+                                "int": int,
+                                "float": float,
+                            }
+                            
+                            try:
+                                # First attempt: try literal_eval for safety (handles arithmetic in literals)
+                                try:
+                                    evaluated_dict = ast.literal_eval(python_dict_str)
+                                except:
+                                    # Second attempt: use eval with restricted namespace
+                                    evaluated_dict = eval(python_dict_str, safe_namespace, safe_dict)
+                                
+                                # Verify result is a dict with numeric values
+                                if isinstance(evaluated_dict, dict):
+                                    vars_dict = {}
+                                    for k, v in evaluated_dict.items():
+                                        try:
+                                            if isinstance(v, (int, float)):
+                                                vars_dict[k] = float(v)
+                                            elif v is None:
+                                                vars_dict[k] = 0.0  # Handle null values
+                                            else:
+                                                # Try to convert to float
+                                                vars_dict[k] = float(v)
+                                        except:
+                                            # Skip entries that can't be converted
+                                            print(f"  Warning: Skipping VARS entry '{k}': {v}")
+                                            continue
+                                    
+                                    if vars_dict:  # Only succeed if we got at least one valid entry
+                                        print(f"  Successfully parsed VARS by evaluating expressions ({len(vars_dict)} entries)")
+                            except Exception as eval_error:
+                                print(f"  Failed to evaluate VARS dict: {eval_error}")
+                        except Exception as fix_error:
+                            print(f"  Failed to fix VARS: {fix_error}")
 
         # Extract TRACE
         trace_match = re.search(
