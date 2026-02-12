@@ -2,6 +2,7 @@
 # This file will be populated by AI code generator based on experimental design
 
 defaults:
+  - _self_
   - run: ???  # Required: specify via command line (e.g., run=proposed-bert-imdb)
 
 # Execution mode: main, sanity_check, or pilot
