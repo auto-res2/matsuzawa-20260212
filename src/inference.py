@@ -28,38 +28,35 @@ Question: {question}
 
 Think step by step and end with your final answer."""
 
-ET_COT_PROMPT = """Solve this math word problem using a structured format. You must output:
-1. VARS: A JSON dictionary of named intermediate quantities (ONLY literal numbers, NO expressions or calculations)
-2. TRACE: Python-like assignments using only numbers and previously defined variables
-3. FINAL: The final numeric answer
+ET_COT_PROMPT = """Solve the math problem step-by-step. Format your answer EXACTLY like the examples below.
 
-Format your response exactly like this:
-VARS: {{"var1": 5, "var2": 10}}
+Example 1:
+Question: Sarah has 3 apples. She buys 2 more. How many does she have?
+VARS: {{"initial": 3, "bought": 2}}
 TRACE:
-result1 = var1 + var2
-result2 = result1 * 3
-FINAL: <number>
+total = initial + bought
+FINAL: 5
 
-IMPORTANT: In VARS, use ONLY literal numbers like 5, 10.5, -3. Do NOT use expressions like 3*60 or 150/100.
-Put all calculations in the TRACE section instead.
+Example 2:
+Question: A box costs $10 and there is a 20% discount. What is the final price?
+VARS: {{"price": 10, "discount_rate": 0.2}}
+TRACE:
+discount = price * discount_rate
+final_price = price - discount
+FINAL: 8
+
+Now solve this problem using the same format (VARS, TRACE, FINAL):
+Question: {question}"""
+
+ET_COT_REPAIR_PROMPT = """The previous answer had an error: {error_message}
+
+Provide a corrected solution in this format:
+VARS: {{"var1": value, "var2": value}}
+TRACE:
+step1 = var1 + var2
+FINAL: answer
 
 Question: {question}
-
-Provide your structured solution:"""
-
-ET_COT_REPAIR_PROMPT = """Your previous solution failed verification: {error_message}
-
-Please provide a CORRECTED solution in the same structured format:
-VARS: {{...}}  (use ONLY literal numbers, NO expressions or variable references)
-TRACE:
-...
-FINAL: <number>
-
-Remember: VARS must contain only literal numbers like 5, 10.5, -3.
-All calculations must go in the TRACE section.
-
-Question: {question}
-
 Corrected solution:"""
 
 
@@ -111,7 +108,12 @@ def parse_et_cot_response(
 
     try:
         # Extract VARS - find JSON object after VARS: (handling nested braces and multiline)
+        # Try multiple patterns to be flexible
         vars_start = re.search(r"VARS:\s*", response, re.IGNORECASE)
+        if not vars_start:
+            # Try without colon
+            vars_start = re.search(r"VARS\s+", response, re.IGNORECASE)
+        
         if vars_start:
             # Start from position after "VARS:"
             json_start_pos = vars_start.end()
@@ -205,23 +207,59 @@ def parse_et_cot_response(
                         except Exception as fix_error:
                             print(f"  Failed to fix VARS: {fix_error}")
 
-        # Extract TRACE
+        # Extract TRACE - be more flexible with whitespace and format
         trace_match = re.search(
-            r"TRACE:\s*\n((?:.*\n)*?)(?:FINAL:|$)", response, re.IGNORECASE
+            r"TRACE:\s*\n((?:.*\n)*?)(?:FINAL:|$)", response, re.IGNORECASE | re.DOTALL
         )
         if trace_match:
             trace_code = trace_match.group(1).strip()
+        
+        # If TRACE not found with newline, try without newline requirement
+        if not trace_code:
+            trace_match = re.search(
+                r"TRACE:\s*(.*?)(?:FINAL:|$)", response, re.IGNORECASE | re.DOTALL
+            )
+            if trace_match:
+                trace_code = trace_match.group(1).strip()
 
-        # Extract FINAL
+        # Extract FINAL - be more flexible
         final_match = re.search(
             r"FINAL:\s*([-+]?[\d,]+\.?\d*)", response, re.IGNORECASE
         )
         if final_match:
             final_answer = float(final_match.group(1).replace(",", ""))
+        
+        # If FINAL not found with colon, try looking for "FINAL" followed by number
+        if final_answer is None:
+            final_match = re.search(
+                r"FINAL\s+([-+]?[\d,]+\.?\d*)", response, re.IGNORECASE
+            )
+            if final_match:
+                final_answer = float(final_match.group(1).replace(",", ""))
 
     except Exception as e:
         print(f"Warning: Failed to parse ET-CoT response: {e}")
         print(f"  Response preview: {response[:300]}")
+    
+    # If we still don't have all components, try more aggressive parsing
+    if not vars_dict and final_answer is None:
+        # Look for any JSON-like dict in the response
+        json_match = re.search(r'\{[^{}]*\}', response)
+        if json_match:
+            try:
+                vars_dict = json.loads(json_match.group(0))
+            except:
+                pass
+    
+    if not trace_code:
+        # Look for assignment-like patterns
+        assignments = re.findall(r'^\s*(\w+)\s*=\s*(.+)$', response, re.MULTILINE)
+        if assignments:
+            trace_code = '\n'.join(f"{var} = {expr}" for var, expr in assignments)
+    
+    if final_answer is None:
+        # Try to find ANY number in the response as last resort
+        final_answer = extract_number_from_text(response)
 
     return vars_dict, trace_code, final_answer
 
@@ -235,8 +273,19 @@ def verify_et_cot_trace(
     Returns:
         (is_valid, error_message)
     """
-    if not vars_dict or not trace_code or final_answer is None:
-        return False, "Missing required components (VARS, TRACE, or FINAL)"
+    # Check for None explicitly since empty dict/string are also falsy
+    if vars_dict is None or trace_code is None or final_answer is None:
+        missing = []
+        if vars_dict is None:
+            missing.append("VARS")
+        if trace_code is None:
+            missing.append("TRACE")
+        if final_answer is None:
+            missing.append("FINAL")
+        return False, f"Missing required components: {', '.join(missing)}"
+    
+    if not vars_dict or not trace_code:
+        return False, "Empty VARS or TRACE (model may not be following format)"
 
     try:
         # Create execution namespace with initial variables
@@ -366,6 +415,11 @@ def run_inference(cfg: Dict) -> None:
 
             # Parse response
             vars_dict, trace_code, predicted_answer = parse_et_cot_response(response)
+            
+            # Debug: print parsing results for first example
+            if i == 0:
+                print(f"\n  [DEBUG] First example response preview: {response[:300]}")
+                print(f"  [DEBUG] Parsed - VARS: {vars_dict}, TRACE: {trace_code[:50] if trace_code else None}, FINAL: {predicted_answer}")
 
             # Verify trace
             verification_passed = False
