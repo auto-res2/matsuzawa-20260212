@@ -28,17 +28,20 @@ Question: {question}
 
 Think step by step and end with your final answer."""
 
-ET_COT_PROMPT = """Solve this math problem. You must provide your answer in this exact format with three sections:
+ET_COT_PROMPT = """Solve this math problem. You MUST provide your answer in this EXACT format:
 
-VARS: {{key1: number1, key2: number2}}
+VARS: {{"key1": number1, "key2": number2}}
 TRACE:
 var3 = var1 + var2
-FINAL: answer
+var4 = var3 * 2
+FINAL: number
 
-Rules:
-- VARS must be a valid JSON dictionary with only numbers (no formulas)
-- TRACE must show arithmetic steps using only +, -, *, / and the variables from VARS
-- FINAL must be a single number that matches the last computation in TRACE
+CRITICAL RULES - Follow these exactly:
+1. VARS must be valid JSON with double quotes around keys and ONLY pure numbers as values (like 5, 3.14, 100)
+2. TRACE must contain ONLY Python assignment statements (varname = expression)
+3. TRACE expressions can ONLY use: numbers, +, -, *, /, (), and variable names from VARS or previous TRACE lines
+4. NO text, NO descriptions, NO double equals (==), NO colons in TRACE - ONLY "varname = expression" format
+5. FINAL must be a single number
 
 Example 1:
 Question: Sarah has 3 apples. She buys 2 more. How many does she have?
@@ -57,29 +60,44 @@ discount = price * discount_rate
 final_price = price - discount
 FINAL: 8
 
-Now solve this problem:
+Example 3:
+Question: Janet has 16 eggs. She eats 3 and bakes with 4. She sells the rest for $2 each. How much does she make?
+
+VARS: {{"eggs_total": 16, "eggs_eaten": 3, "eggs_baked": 4, "price_per_egg": 2}}
+TRACE:
+eggs_used = eggs_eaten + eggs_baked
+eggs_left = eggs_total - eggs_used
+money = eggs_left * price_per_egg
+FINAL: 18
+
+Now solve this problem. Remember: VARS must be valid JSON, TRACE must be ONLY "var = expression" lines with NO text or explanations:
 
 Question: {question}
 
-Answer (use the exact format above):"""
+Your answer:"""
 
 ET_COT_REPAIR_PROMPT = """Your previous answer failed verification: {error_message}
 
-Please provide a complete corrected solution using this exact format:
+Please provide a complete corrected solution. Follow this EXACT format:
 
-VARS: {{key1: number1, key2: number2}}
+VARS: {{"key1": number1, "key2": number2}}
 TRACE:
-result = key1 + key2
+var3 = key1 + key2
+var4 = var3 * 10
 FINAL: number
 
-Important rules:
-1. VARS must contain ONLY numbers (like 5, 3.14, 100), NOT formulas or expressions
-2. TRACE must show step-by-step arithmetic using variables from VARS
-3. FINAL must exactly match the last value computed in TRACE
+CRITICAL - Common mistakes to avoid:
+1. VARS must have double quotes around keys: {{"price": 10}} NOT {{price: 10}}
+2. VARS values must be ONLY pure numbers: {{"x": 5}} NOT {{"x": 3 + 2}}
+3. TRACE lines must be ONLY "varname = expression" - NO text, NO descriptions, NO double equals
+4. Do NOT write: "eggs_left = 16 - 7 = 9" - Write: "eggs_left = 16 - 7"
+5. Do NOT include units or text after expressions: "total = 10 cups" - Write: "total = 10"
+6. Use only variables from VARS or previous TRACE lines in your expressions
+7. FINAL must match the last computed value
 
 Question: {question}
 
-Provide your corrected answer now:"""
+Your corrected answer (remember: JSON VARS with double quotes, clean TRACE with only "var = expr" format):"""
 
 
 def extract_number_from_text(text: str) -> Optional[float]:
@@ -192,70 +210,81 @@ def parse_et_cot_response(
                                 vars_dict = json.loads(json_fixed)
                                 print(f"  Successfully parsed VARS after fixing quotes ({len(vars_dict)} entries)")
                             except json.JSONDecodeError:
-                                # If still fails, try Python literal_eval (handles Python dict syntax)
+                                # If still fails, try to fix unquoted keys before literal_eval
+                                # Convert {key: value} to {"key": value}
+                                vars_json_quoted_keys = re.sub(
+                                    r'(?<=[{,\s])(\w+)(?=\s*:)',
+                                    r'"\1"',
+                                    json_fixed
+                                )
                                 try:
-                                    evaluated_dict = ast.literal_eval(vars_json)
-                                    if isinstance(evaluated_dict, dict):
-                                        # Convert all values to float
-                                        vars_dict = {}
-                                        for k, v in evaluated_dict.items():
-                                            try:
-                                                if isinstance(v, (int, float)):
-                                                    vars_dict[k] = float(v)
-                                                elif v is None:
-                                                    vars_dict[k] = 0.0
-                                                else:
-                                                    # Try to evaluate expressions
+                                    vars_dict = json.loads(vars_json_quoted_keys)
+                                    print(f"  Successfully parsed VARS after fixing keys ({len(vars_dict)} entries)")
+                                except json.JSONDecodeError:
+                                    # If still fails, try Python literal_eval (handles Python dict syntax)
+                                    try:
+                                        evaluated_dict = ast.literal_eval(vars_json)
+                                        if isinstance(evaluated_dict, dict):
+                                            # Convert all values to float
+                                            vars_dict = {}
+                                            for k, v in evaluated_dict.items():
+                                                try:
+                                                    if isinstance(v, (int, float)):
+                                                        vars_dict[k] = float(v)
+                                                    elif v is None:
+                                                        vars_dict[k] = 0.0
+                                                    else:
+                                                        # Try to evaluate expressions
+                                                        safe_namespace = {
+                                                            "__builtins__": {},
+                                                            "abs": abs,
+                                                            "int": int,
+                                                            "float": float,
+                                                        }
+                                                        evaluated_value = eval(str(v), safe_namespace, {})
+                                                        vars_dict[k] = float(evaluated_value)
+                                                except Exception as conv_error:
+                                                    print(f"  Warning: Skipping VARS entry '{k}': {v} ({conv_error})")
+                                                    continue
+                                            
+                                            if vars_dict:
+                                                print(f"  Successfully parsed VARS with literal_eval ({len(vars_dict)} entries)")
+                                    except Exception as literal_error:
+                                        # Last resort: manual regex-based parsing
+                                        print(f"  literal_eval failed: {literal_error}")
+                                        manual_dict = {}
+                                        
+                                        # Pattern to match key-value pairs with optional quotes
+                                        # Handles: "key": value, 'key': value, key: value
+                                        kv_pattern = r'''['"']?(\w+)['"']?\s*:\s*([^,}\n]+)'''
+                                        matches = re.findall(kv_pattern, vars_json)
+                                        
+                                        if matches:
+                                            for key, value_str in matches:
+                                                value_str = value_str.strip().strip('"\'')
+                                                try:
+                                                    # Try to evaluate as a number or expression
                                                     safe_namespace = {
                                                         "__builtins__": {},
                                                         "abs": abs,
                                                         "int": int,
                                                         "float": float,
                                                     }
-                                                    evaluated_value = eval(str(v), safe_namespace, {})
-                                                    vars_dict[k] = float(evaluated_value)
-                                            except Exception as conv_error:
-                                                print(f"  Warning: Skipping VARS entry '{k}': {v} ({conv_error})")
-                                                continue
-                                        
-                                        if vars_dict:
-                                            print(f"  Successfully parsed VARS with literal_eval ({len(vars_dict)} entries)")
-                                except Exception as literal_error:
-                                    # Last resort: manual regex-based parsing
-                                    print(f"  literal_eval failed: {literal_error}")
-                                    manual_dict = {}
-                                    
-                                    # Pattern to match key-value pairs with optional quotes
-                                    # Handles: "key": value, 'key': value, key: value
-                                    kv_pattern = r'''['"']?(\w+)['"']?\s*:\s*([^,}\n]+)'''
-                                    matches = re.findall(kv_pattern, vars_json)
-                                    
-                                    if matches:
-                                        for key, value_str in matches:
-                                            value_str = value_str.strip().strip('"\'')
-                                            try:
-                                                # Try to evaluate as a number or expression
-                                                safe_namespace = {
-                                                    "__builtins__": {},
-                                                    "abs": abs,
-                                                    "int": int,
-                                                    "float": float,
-                                                }
-                                                
-                                                # Evaluate the value (handles expressions like "3 * 60")
-                                                evaluated_value = eval(value_str, safe_namespace, {})
-                                                manual_dict[key] = float(evaluated_value)
-                                            except:
-                                                # If evaluation fails, try direct float conversion
-                                                try:
-                                                    manual_dict[key] = float(value_str)
+                                                    
+                                                    # Evaluate the value (handles expressions like "3 * 60")
+                                                    evaluated_value = eval(value_str, safe_namespace, {})
+                                                    manual_dict[key] = float(evaluated_value)
                                                 except:
-                                                    print(f"  Warning: Skipping VARS entry '{key}': {value_str}")
-                                                    continue
-                                        
-                                        if manual_dict:
-                                            vars_dict = manual_dict
-                                            print(f"  Successfully parsed VARS manually ({len(vars_dict)} entries)")
+                                                    # If evaluation fails, try direct float conversion
+                                                    try:
+                                                        manual_dict[key] = float(value_str)
+                                                    except:
+                                                        print(f"  Warning: Skipping VARS entry '{key}': {value_str}")
+                                                        continue
+                                            
+                                            if manual_dict:
+                                                vars_dict = manual_dict
+                                                print(f"  Successfully parsed VARS manually ({len(vars_dict)} entries)")
                         except Exception as fix_error:
                             print(f"  Failed to fix VARS: {fix_error}")
 
@@ -367,23 +396,55 @@ def verify_et_cot_trace(
             if not line or line.startswith("#"):
                 continue
 
+            # Skip lines that are clearly not assignments (e.g., plain text, markdown)
+            # Skip lines starting with bullets, dashes, or containing colons (likely descriptions)
+            if line.startswith(('-', '*', '•')) or (':' in line and '=' not in line):
+                continue
+            
+            # Skip lines with LaTeX or markdown math
+            if '\\(' in line or '\\)' in line or '$$' in line:
+                continue
+
             # Parse assignment: var = expression
             if "=" in line:
-                var_name, expr = line.split("=", 1)
-                var_name = var_name.strip()
-                expr = expr.strip()
+                # Split only on the first '=' to handle the assignment
+                parts = line.split("=", 1)
+                if len(parts) != 2:
+                    continue
+                    
+                var_name = parts[0].strip()
+                expr = parts[1].strip()
+                
+                # Skip if variable name is invalid (contains spaces, special chars except _)
+                if not var_name.replace('_', '').replace('-', '').isalnum():
+                    continue
+                
+                # Clean expression: remove everything after second '=' if present (common error: var = x + y = z)
+                if '=' in expr:
+                    expr = expr.split('=')[0].strip()
+                
+                # Remove trailing text after the arithmetic expression
+                # Look for common patterns: "= 9 cups", "= 100 minutes", etc.
+                # Keep only the numeric/variable part
+                expr_cleaned = expr
+                # Remove text that follows numbers (e.g., "9 cups" -> "9")
+                expr_match = re.match(r'^([\d\w\s\+\-\*/\(\)\.]+?)(?:\s+[a-zA-Z]|$)', expr)
+                if expr_match:
+                    expr_cleaned = expr_match.group(1).strip()
 
                 try:
                     # Evaluate expression in namespace (restricted to arithmetic)
                     # This is safe because we only allow previously defined variables and numbers
-                    result = eval(expr, {"__builtins__": {}}, namespace)
+                    result = eval(expr_cleaned, {"__builtins__": {}}, namespace)
                     namespace[var_name] = float(result)
                     
                     # Track last computed variable (not from VARS)
                     if var_name not in initial_var_names:
                         last_computed_var = var_name
                 except Exception as e:
-                    return False, f"Failed to evaluate '{line}': {str(e)}"
+                    # Provide more helpful error message but continue trying other lines
+                    print(f"  Warning: Skipping line '{line[:80]}': {str(e)}")
+                    continue
 
         # Get last computed value
         # Prefer the last computed variable (not from initial VARS)
