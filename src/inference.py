@@ -28,45 +28,58 @@ Question: {question}
 
 Think step by step and end with your final answer."""
 
-ET_COT_PROMPT = """Solve this math problem using the exact format shown below. Your answer must have three sections: VARS (a JSON dictionary), TRACE (Python-like arithmetic steps), and FINAL (the numeric answer).
+ET_COT_PROMPT = """Solve this math problem. You must provide your answer in this exact format with three sections:
 
-Example format:
+VARS: {{key1: number1, key2: number2}}
+TRACE:
+var3 = var1 + var2
+FINAL: answer
 
+Rules:
+- VARS must be a valid JSON dictionary with only numbers (no formulas)
+- TRACE must show arithmetic steps using only +, -, *, / and the variables from VARS
+- FINAL must be a single number that matches the last computation in TRACE
+
+Example 1:
 Question: Sarah has 3 apples. She buys 2 more. How many does she have?
-Answer:
+
 VARS: {{"initial": 3, "bought": 2}}
 TRACE:
 total = initial + bought
 FINAL: 5
 
+Example 2:
 Question: A box costs $10 and there is a 20% discount. What is the final price?
-Answer:
+
 VARS: {{"price": 10, "discount_rate": 0.2}}
 TRACE:
 discount = price * discount_rate
 final_price = price - discount
 FINAL: 8
 
-Now solve this problem following the exact same format:
+Now solve this problem:
 
 Question: {question}
-Answer:"""
 
-ET_COT_REPAIR_PROMPT = """The previous answer had an error: {error_message}
+Answer (use the exact format above):"""
 
-You MUST provide a corrected solution with all three required sections.
+ET_COT_REPAIR_PROMPT = """Your previous answer failed verification: {error_message}
 
-Format requirements:
-VARS: {{"var1": value, "var2": value}}
+Please provide a complete corrected solution using this exact format:
+
+VARS: {{key1: number1, key2: number2}}
 TRACE:
-step1 = var1 + var2
-step2 = step1 * 3
-FINAL: answer_number
+result = key1 + key2
+FINAL: number
+
+Important rules:
+1. VARS must contain ONLY numbers (like 5, 3.14, 100), NOT formulas or expressions
+2. TRACE must show step-by-step arithmetic using variables from VARS
+3. FINAL must exactly match the last value computed in TRACE
 
 Question: {question}
 
-Corrected solution:
-VARS:"""
+Provide your corrected answer now:"""
 
 
 def extract_number_from_text(text: str) -> Optional[float]:
@@ -170,52 +183,93 @@ def parse_et_cot_response(
                         print(f"Warning: Failed to parse VARS JSON: {je}")
                         print(f"  Attempted to parse: {vars_json[:200]}")
                         
-                        # Try to fix common issues: expressions in JSON values
-                        # The model often puts arithmetic expressions like "3 * 60" or "150 / 100" in JSON
-                        # We need to evaluate these expressions to get valid JSON
+                        # Try to fix common issues: expressions in JSON values or string values
+                        # The model often puts:
+                        # 1. Arithmetic expressions like "3 * 60" or "150 / 100" in JSON
+                        # 2. String values that should be numbers
+                        # 3. Missing quotes around strings
                         try:
-                            # Replace null with None for Python parsing
+                            # Replace null/bool literals with Python equivalents
                             python_dict_str = vars_json.replace('null', 'None').replace('true', 'True').replace('false', 'False')
                             
-                            # Use eval with restricted namespace to safely evaluate the dict with expressions
-                            # This allows arithmetic but blocks dangerous operations
-                            safe_dict = {}
-                            safe_namespace = {
-                                "__builtins__": {},
-                                "abs": abs,
-                                "int": int,
-                                "float": float,
-                            }
+                            # Try to extract key-value pairs manually if JSON parsing failed
+                            # This handles cases where values are expressions or have syntax issues
+                            manual_dict = {}
                             
-                            try:
-                                # First attempt: try literal_eval for safety (handles arithmetic in literals)
-                                try:
-                                    evaluated_dict = ast.literal_eval(python_dict_str)
-                                except:
-                                    # Second attempt: use eval with restricted namespace
-                                    evaluated_dict = eval(python_dict_str, safe_namespace, safe_dict)
-                                
-                                # Verify result is a dict with numeric values
-                                if isinstance(evaluated_dict, dict):
-                                    vars_dict = {}
-                                    for k, v in evaluated_dict.items():
+                            # Pattern to match key-value pairs (handles expressions, strings, numbers)
+                            kv_pattern = r'["\']?(\w+)["\']?\s*:\s*([^,}\n]+)'
+                            matches = re.findall(kv_pattern, vars_json)
+                            
+                            if matches:
+                                for key, value_str in matches:
+                                    value_str = value_str.strip().strip('"\'')
+                                    try:
+                                        # Try to evaluate as a number or expression
+                                        # Use a safe namespace with only arithmetic operations
+                                        safe_namespace = {
+                                            "__builtins__": {},
+                                            "abs": abs,
+                                            "int": int,
+                                            "float": float,
+                                        }
+                                        
+                                        # Evaluate the value (handles expressions like "3 * 60")
+                                        evaluated_value = eval(value_str, safe_namespace, {})
+                                        
+                                        # Convert to float
+                                        if isinstance(evaluated_value, (int, float)):
+                                            manual_dict[key] = float(evaluated_value)
+                                        else:
+                                            manual_dict[key] = float(evaluated_value)
+                                    except:
+                                        # If evaluation fails, try direct float conversion
                                         try:
-                                            if isinstance(v, (int, float)):
-                                                vars_dict[k] = float(v)
-                                            elif v is None:
-                                                vars_dict[k] = 0.0  # Handle null values
-                                            else:
-                                                # Try to convert to float
-                                                vars_dict[k] = float(v)
+                                            manual_dict[key] = float(value_str)
                                         except:
                                             # Skip entries that can't be converted
-                                            print(f"  Warning: Skipping VARS entry '{k}': {v}")
+                                            print(f"  Warning: Skipping VARS entry '{key}': {value_str}")
                                             continue
+                                
+                                if manual_dict:
+                                    vars_dict = manual_dict
+                                    print(f"  Successfully parsed VARS manually ({len(vars_dict)} entries)")
+                            
+                            # Fallback: Try Python eval with full dict string
+                            if not vars_dict:
+                                try:
+                                    safe_namespace = {
+                                        "__builtins__": {},
+                                        "abs": abs,
+                                        "int": int,
+                                        "float": float,
+                                    }
                                     
-                                    if vars_dict:  # Only succeed if we got at least one valid entry
-                                        print(f"  Successfully parsed VARS by evaluating expressions ({len(vars_dict)} entries)")
-                            except Exception as eval_error:
-                                print(f"  Failed to evaluate VARS dict: {eval_error}")
+                                    # Try literal_eval first (safest)
+                                    try:
+                                        evaluated_dict = ast.literal_eval(python_dict_str)
+                                    except:
+                                        # Then try eval with restricted namespace
+                                        evaluated_dict = eval(python_dict_str, safe_namespace, {})
+                                    
+                                    # Convert all values to float
+                                    if isinstance(evaluated_dict, dict):
+                                        vars_dict = {}
+                                        for k, v in evaluated_dict.items():
+                                            try:
+                                                if isinstance(v, (int, float)):
+                                                    vars_dict[k] = float(v)
+                                                elif v is None:
+                                                    vars_dict[k] = 0.0
+                                                else:
+                                                    vars_dict[k] = float(v)
+                                            except:
+                                                print(f"  Warning: Skipping VARS entry '{k}': {v}")
+                                                continue
+                                        
+                                        if vars_dict:
+                                            print(f"  Successfully parsed VARS with eval ({len(vars_dict)} entries)")
+                                except Exception as eval_error:
+                                    print(f"  Failed to evaluate VARS dict: {eval_error}")
                         except Exception as fix_error:
                             print(f"  Failed to fix VARS: {fix_error}")
 
@@ -309,7 +363,17 @@ def verify_et_cot_trace(
 
     try:
         # Create execution namespace with initial variables
-        namespace = dict(vars_dict)
+        # Ensure all values are numeric (float)
+        namespace = {}
+        for k, v in vars_dict.items():
+            try:
+                namespace[k] = float(v)
+            except (ValueError, TypeError):
+                return False, f"VARS entry '{k}' has non-numeric value: {v}"
+
+        # Track which variables were defined to identify the last computed one
+        initial_var_names = set(namespace.keys())
+        last_computed_var = None
 
         # Execute trace line by line (only simple arithmetic)
         for line in trace_code.split("\n"):
@@ -323,17 +387,28 @@ def verify_et_cot_trace(
                 var_name = var_name.strip()
                 expr = expr.strip()
 
-                # Evaluate expression in namespace (restricted to arithmetic)
-                # This is safe because we only allow previously defined variables and numbers
-                result = eval(expr, {"__builtins__": {}}, namespace)
-                namespace[var_name] = result
+                try:
+                    # Evaluate expression in namespace (restricted to arithmetic)
+                    # This is safe because we only allow previously defined variables and numbers
+                    result = eval(expr, {"__builtins__": {}}, namespace)
+                    namespace[var_name] = float(result)
+                    
+                    # Track last computed variable (not from VARS)
+                    if var_name not in initial_var_names:
+                        last_computed_var = var_name
+                except Exception as e:
+                    return False, f"Failed to evaluate '{line}': {str(e)}"
 
         # Get last computed value
-        if not namespace:
+        # Prefer the last computed variable (not from initial VARS)
+        if last_computed_var:
+            last_computed_value = namespace[last_computed_var]
+        elif namespace:
+            # Fallback: use last variable in namespace
+            last_var_name = list(namespace.keys())[-1]
+            last_computed_value = namespace[last_var_name]
+        else:
             return False, "No variables computed in trace"
-
-        last_var_name = list(namespace.keys())[-1]
-        last_computed_value = namespace[last_var_name]
 
         # Unit test 1: FINAL matches last computed value (within tolerance)
         if abs(last_computed_value - final_answer) > 1e-6:
@@ -446,9 +521,22 @@ def run_inference(cfg: Dict) -> None:
             error_message = None
 
             if cfg["inference"].get("verification", {}).get("enabled", False):
-                verification_passed, error_message = verify_et_cot_trace(
-                    vars_dict, trace_code, predicted_answer, question
-                )
+                # Only verify if we have all components
+                if vars_dict is not None and trace_code is not None and predicted_answer is not None:
+                    verification_passed, error_message = verify_et_cot_trace(
+                        vars_dict, trace_code, predicted_answer, question
+                    )
+                else:
+                    # Missing components - set error message
+                    missing = []
+                    if vars_dict is None:
+                        missing.append("VARS")
+                    if trace_code is None:
+                        missing.append("TRACE")
+                    if predicted_answer is None:
+                        missing.append("FINAL")
+                    error_message = f"Missing required components: {', '.join(missing)}"
+                    verification_passed = False
 
                 # Repair attempt if verification failed
                 if not verification_passed and max_retries > 0:
@@ -460,17 +548,24 @@ def run_inference(cfg: Dict) -> None:
                     repair_response = generator.generate(
                         repair_prompt,
                         max_new_tokens=cfg["model"]["max_new_tokens"],
-                        temperature=cfg["model"]["temperature"],
+                        temperature=max(0.1, cfg["model"]["temperature"] * 0.5),  # Lower temp for repair
                         do_sample=cfg["model"]["do_sample"],
                     )
 
                     # Parse repaired response
-                    vars_dict, trace_code, predicted_answer = parse_et_cot_response(
+                    vars_dict_repaired, trace_code_repaired, predicted_answer_repaired = parse_et_cot_response(
                         repair_response
                     )
-                    verification_passed, error_message = verify_et_cot_trace(
-                        vars_dict, trace_code, predicted_answer, question
-                    )
+                    
+                    # Only use repaired response if it's better
+                    if vars_dict_repaired is not None and trace_code_repaired is not None and predicted_answer_repaired is not None:
+                        verification_passed, error_message = verify_et_cot_trace(
+                            vars_dict_repaired, trace_code_repaired, predicted_answer_repaired, question
+                        )
+                        
+                        if verification_passed or predicted_answer is None:
+                            # Use repaired response if it passed verification or original had no answer
+                            vars_dict, trace_code, predicted_answer = vars_dict_repaired, trace_code_repaired, predicted_answer_repaired
             else:
                 verification_passed = True
             

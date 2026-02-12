@@ -22,8 +22,12 @@ def main(cfg: DictConfig) -> None:
         # Use sanity WandB namespace
         if "sanity" not in cfg.wandb.project:
             cfg.wandb.project = f"{cfg.wandb.project}-sanity"
-        # Lower temperature slightly for more consistent formatting in sanity checks
-        if cfg.model.temperature > 0.3:
+        # Lower temperature for more consistent formatting in sanity checks
+        # For structured output formats like ET-CoT, use very low temperature
+        if cfg.run.method == "et_cot":
+            cfg.model.temperature = 0.1
+            cfg.model.do_sample = True
+        elif cfg.model.temperature > 0.3:
             cfg.model.temperature = 0.3
     
     # Print configuration
