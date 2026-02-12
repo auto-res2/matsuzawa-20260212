@@ -1,0 +1,296 @@
+﻿name: "Run Full Experiment"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+      run_id:
+        description: "The specific run_id for the full experiment"
+        required: true
+      runner_label:
+        description: 'Runner label (e.g., ["ubuntu-latest"], ["self-hosted", "A100"])'
+        required: true
+        default: '["ubuntu-latest"]'
+      github_actions_agent:
+        description: 'AI agent tool to use (claude_code or open_code)'
+        required: true
+        type: choice
+        options:
+          - claude_code
+          - open_code
+        default: 'claude_code'
+      model_name:
+        description: 'Model to use (for OpenCode: openrouter/openai/gpt-5-nano, for Claude Code: sonnet/opus/haiku)'
+        required: true
+        default: 'sonnet'
+      retry_count:
+        description: 'Current retry attempt (internal use)'
+        required: false
+        default: '0'
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+env:
+  RESULTS_DIR: ".research/results"
+
+# Why jobs are split into `run-experiment` and `fix-and-rerun`:
+# 1. Runner Stability: The AI agent (fix-and-rerun) is kept on a CPU runner to prevent
+#    bus errors that can occur on GPU environments.
+# 2. Reliable Error Analysis: This separation ensures experiment logs are saved as artifacts
+#    upon failure. If run in a single job, the agent's retry logic could lose the
+#    original error context, making a fix impossible.
+
+jobs:
+  run-experiment:
+    name: Run Full Experiment
+    runs-on: ${{ fromJSON(github.event.inputs.runner_label) }}
+    timeout-minutes: 6000
+
+    outputs:
+      experiment_passed: ${{ steps.check-result.outputs.passed }}
+
+    env:
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+
+      - name: Prepare results dir
+        run: mkdir -p "$RESULTS_DIR"
+
+      - name: Run experiment
+        id: run-exp
+        continue-on-error: true
+        run: |
+          trap 'sleep 1' EXIT
+          (
+            set -e
+            set -o pipefail
+
+            echo "=== [UV SYNC] Start at $(date -u) ==="
+            uv sync
+            echo "=== [UV SYNC] Finished successfully at $(date -u) ==="
+
+            echo "=== [FULL EXPERIMENT] Start for ${{ github.event.inputs.run_id }} at $(date -u) ==="
+            uv run python -u -m src.main \
+              run=${{ github.event.inputs.run_id }} \
+              results_dir="$RESULTS_DIR" \
+              mode=full
+            echo "=== [FULL EXPERIMENT] PASSED for ${{ github.event.inputs.run_id }} at $(date -u) ==="
+          ) > >(tee -a "$RESULTS_DIR/stdout.txt") 2> >(tee -a "$RESULTS_DIR/stderr.txt" >&2)
+
+      - name: Check result
+        id: check-result
+        run: |
+          if [[ "${{ steps.run-exp.outcome }}" == "success" ]] && grep -q "\[FULL EXPERIMENT\] PASSED" "$RESULTS_DIR/stdout.txt"; then
+            echo "Experiment passed"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Experiment failed"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: experiment-results-${{ github.run.id }}
+          path: ${{ env.RESULTS_DIR }}
+
+
+  fix-and-rerun:
+    name: Fix and Re-run
+    runs-on: ubuntu-latest
+    needs: run-experiment
+    if: needs.run-experiment.outputs.experiment_passed == 'false'
+    timeout-minutes: 60
+
+    env:
+      SEARCH_HF_COMMAND: |
+        curl -s -G \
+          -H "Authorization: Bearer $HF_TOKEN" \
+          --data-urlencode "search=${SEARCH_TERM}" \
+          --data-urlencode "sort=likes" \
+          --data-urlencode "limit=10" \
+          --data-urlencode "direction=-1" \
+          --data-urlencode "full=true" \
+          "https://huggingface.co/api/${RESOURCE_TYPE}" \
+        | jq -r '(.results // .) | map(select(.gated == false and .private == false and .disabled == false)) | .[0]?.id // empty'
+      PROMPT: |
+        Your task is to correct the code for the experiment associated with run ID ${{ github.event.inputs.run_id }}.
+        You have been granted full tool access.
+
+        Your operational environment is a standard CPU-only runner without GPUs.
+        Any attempt to run the experiment code will fail and lead to incorrect conclusions. Your sole responsibility is to **modify the code to make it runnable**.
+        The actual experiment will be executed in a separate, GPU-enabled environment after your corrections.
+
+        ERROR INFORMATION:
+        The error logs are available in the file: $RESULTS_DIR/error_summary.txt
+        Read this file to understand what went wrong. DO NOT read stdout.txt or stderr.txt as they contain verbose training logs.
+
+        Guiding Principles:
+        - Scope: Do not perform any Git operations like commit or push. Your only task is to fix the code to make it executable.
+        - Method: When fixing errors, you MUST only modify existing files; do not create or delete any files.
+        - Autonomy: Perform all correction steps autonomously. Do not ask for permission.
+        - Resource Errors: If a Hugging Face resource is unavailable, you MUST find and implement a public alternative. To do this, you MUST first set two variables:
+          1.  `RESOURCE_TYPE`: Set to either `"models"` or `"datasets"`.
+          2.  `SEARCH_TERM`: Set to the resource name from the error to find a corrected or alternative ID.
+          Then, execute `bash -c "$SEARCH_HF_COMMAND"` to get the best alternative ID and update the code.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download experiment results
+        uses: actions/download-artifact@v4
+        with:
+          name: experiment-results-${{ github.run.id }}
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Extract error summary
+        run: |
+          if [ -f "$RESULTS_DIR/stderr.txt" ]; then
+            echo "=== ERROR SUMMARY (Last 100 lines of stderr) ===" > "$RESULTS_DIR/error_summary.txt"
+            tail -n 100 "$RESULTS_DIR/stderr.txt" >> "$RESULTS_DIR/error_summary.txt"
+          fi
+
+          if [ -f "$RESULTS_DIR/stdout.txt" ]; then
+            echo -e "\n=== RELEVANT STDOUT (Error/Exception lines) ===" >> "$RESULTS_DIR/error_summary.txt"
+            grep -i -E "(error|exception|traceback|failed|fatal)" "$RESULTS_DIR/stdout.txt" | tail -n 50 >> "$RESULTS_DIR/error_summary.txt" || echo "No error patterns found in stdout" >> "$RESULTS_DIR/error_summary.txt"
+          fi
+
+          cat "$RESULTS_DIR/error_summary.txt"
+
+      - name: Run Claude Code to fix errors
+        if: github.event.inputs.github_actions_agent == 'claude_code'
+        uses: ./.github/actions/run-claude-code
+        with:
+          prompt: ${{ env.PROMPT }}
+          model_name: ${{ github.event.inputs.model_name }}
+          timeout_minutes: '10'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+      - name: Run OpenCode to fix errors
+        if: github.event.inputs.github_actions_agent == 'open_code'
+        uses: ./.github/actions/run-open-code
+        with:
+          prompt: ${{ env.PROMPT }}
+          model_name: ${{ github.event.inputs.model_name }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASEURL: ${{ secrets.LANGFUSE_BASE_URL }}
+
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_VERSION: "2024-10-01-preview"
+
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Commit and push fix
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add --update .
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Automated fix for run_id=${{ github.event.inputs.run_id }} using ${{ github.event.inputs.github_actions_agent }}"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "AI agent made no changes to the code."
+          fi
+
+      - name: Check retry limit
+        id: check-retry
+        run: |
+          RETRY_COUNT=${{ github.event.inputs.retry_count }}
+          MAX_RETRIES=10
+          
+          if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
+            echo "Max retries ($MAX_RETRIES) reached. Failing workflow."
+            echo "should_retry=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "Retry attempt $RETRY_COUNT of $MAX_RETRIES"
+            echo "should_retry=true" >> "$GITHUB_OUTPUT"
+            echo "next_retry=$((RETRY_COUNT + 1))" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger next iteration
+        if: steps.check-retry.outputs.should_retry == 'true'
+        run: |
+          echo "Re-running workflow (attempt ${{ steps.check-retry.outputs.next_retry }})"
+          gh workflow run "${{ github.workflow }}" --ref ${{ github.ref }} \
+            -f branch_name='${{ github.event.inputs.branch_name }}' \
+            -f run_id="${{ github.event.inputs.run_id }}" \
+            -f runner_label='${{ github.event.inputs.runner_label }}' \
+            -f github_actions_agent='${{ github.event.inputs.github_actions_agent }}' \
+            -f model_name='${{ github.event.inputs.model_name }}' \
+            -f retry_count='${{ steps.check-retry.outputs.next_retry }}'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+
+  commit-successful-results:
+      name: Commit Successful Results
+      runs-on: ubuntu-latest
+      needs: run-experiment
+      if: needs.run-experiment.outputs.experiment_passed == 'true'
+
+      steps:
+        - name: Checkout repository
+          uses: actions/checkout@v4
+
+        - name: Download successful results
+          uses: actions/download-artifact@v4
+          with:
+            name: experiment-results-${{ github.run.id }}
+            path: ${{ env.RESULTS_DIR }}
+
+
+        - name: Commit and push experiment results
+          run: |
+            git config --local user.name "github-actions[bot]"
+            git config --local user.email "github-actions[bot]@users.noreply.github.com"
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+            git add .research/
+
+            if ! git diff --staged --quiet; then
+              git commit -m "[CI] Commit all changes from autonomous run (${{ env.RESULTS_DIR }})"
+              for i in {1..5}; do
+                git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+                git push && break
+                echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+                sleep $((2**i))
+              done
+            else
+              echo "No changes were made by the agent or the experiment."
+            fi

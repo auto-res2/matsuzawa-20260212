@@ -1,0 +1,11 @@
+name: Run Pilot Experiment
+
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Placeholder
+        run: echo "予備実験用のワークフロー（未実装）"

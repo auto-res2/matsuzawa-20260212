@@ -1,0 +1,216 @@
+﻿name: "Run Evaluation"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+      run_ids:
+        description: 'A JSON array of run_ids to process'
+        required: true
+      github_actions_agent:
+        description: 'AI agent tool to use (claude_code or open_code)'
+        required: true
+        type: choice
+        options:
+          - claude_code
+          - open_code
+        default: 'claude_code'
+      model_name:
+        description: 'Model to use (for OpenCode: openrouter/openai/gpt-5-nano, for Claude Code: sonnet/opus/haiku)'
+        required: true
+        default: 'sonnet'
+      retry_count:
+        description: 'Current retry attempt (internal use)'
+        required: false
+        default: '0'
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RESULTS_DIR: ".research/results"
+
+jobs:
+  autonomous-evaluation-and-fix:
+    name: Autonomous Evaluation and Fix Cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      SYNC_COMMAND: "uv sync"
+      EVALUATION_COMMAND: |
+        set -e
+        echo "=== [EVALUATION] Start at $(date -u) ==="
+
+        uv run python -m src.evaluate \
+          results_dir="$RESULTS_DIR" \
+          run_ids='${{ inputs.run_ids }}'
+        echo "=== [EVALUATION] PASSED at $(date -u) ==="
+      PROMPT: |
+        You are a fully autonomous AI research assistant.
+        Your task is to ensure the evaluation script runs successfully to completion to generate comparison figures and aggregated metrics, by executing, analyzing, fixing, and re-validating it.
+        You have been granted full tool access.
+
+        Guiding Principles:
+        - Scope: Do not perform any Git operations like commit or push. Your sole responsibility is to make the code runnable.
+        - Method: When fixing errors, you MUST only modify existing files; do not create or delete any files.
+        - Autonomy: Execute all steps autonomously. Do not ask for permission.
+
+        Procedure:
+        1.  Initial Setup: First, run `bash -c "$SYNC_COMMAND"` to install dependencies.
+        2.  Run Evaluation: Execute `bash -c "$EVALUATION_COMMAND"` to generate comparison figures and aggregated metrics.
+        3.  Analyze & Fix Loop: If evaluation fails, you MUST analyze the error, use your tools to fix the code, and then re-run evaluation. Repeat this cycle until it succeeds.
+            A successful run is only confirmed when a message starting with `=== [EVALUATION] PASSED` is present in the output log.
+        4. Visual Quality Check: Once evaluation succeeds, you MUST:
+            a. Locate all generated figures in `$RESULTS_DIR`:
+              - Per-run figures in `$RESULTS_DIR/{run_id}/*.pdf` (or .png)
+              - Comparison figures in `$RESULTS_DIR/comparison/*.pdf` (or .png)
+
+            b. Read and analyze EACH figure by directly viewing the PDF/PNG files (do NOT use JSON files). Assess each figure against the following comprehensive criteria:
+               1. Clarity and Correctness:
+                 - Clear Message: Does the figure convey a clear, unambiguous message? Is the main finding or comparison immediately obvious to the reader?
+                 - Appropriate Chart Type: Is the chosen chart type (e.g., bar, line, scatter) the most effective and conventional way to represent the underlying data and its message?
+                 - Informative Labels: Are the title, axis labels, and legend concise yet fully descriptive? Are units clearly stated where necessary (e.g., "(ms)", "(%)")?
+                 - Data Integrity: Does the visualization accurately represent the data without distortion? Are scales and baselines appropriate?
+
+               2. Visual Polish and Readability:
+                 - Font and Readability: Are all text elements (axis labels, titles, legends, annotations) easily readable and appropriately sized relative to the figure?
+                 - Color and Distinction: Are colors used effectively to distinguish between data series? Are they colorblind-friendly? Is the color scheme professional?
+                 - Layout and Spacing: Is the layout clean, with no overlapping elements? Is whitespace used effectively? Is `tight_layout` or an equivalent applied correctly?
+                 - Data-Ink Ratio: Is the figure free of unnecessary visual clutter (e.g., excessive grid lines, backgrounds, borders)? The focus MUST be on the data itself.
+                 - Resolution: Is the image resolution high enough for publication (e.g., 300 DPI)?
+
+               3. Consistency:
+                 - Scale Consistency: Across related comparison plots, do the Y-axes share a consistent range to allow for fair, unbiased comparison?
+                 - Stylistic Consistency: Is there a consistent style (e.g., fonts, colors, line styles, markers) across all generated figures?
+
+            c. If ANY figure has visual quality issues:
+              - Identify the specific problem (e.g., "font size too small", "inconsistent Y-axis scales")
+              - Modify `src/evaluate.py` to fix the visualization code
+              - Re-run the entire evaluation from step 2
+              - Repeat until ALL figures pass visual quality checks
+
+            d. Only exit successfully when:
+              - Evaluation completes without errors
+              - ALL generated figures meet publication-quality standards
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Prepare results dir
+        run: mkdir -p "$RESULTS_DIR"
+
+      - name: Run Claude Code to fix errors
+        if: github.event.inputs.github_actions_agent == 'claude_code'
+        uses: ./.github/actions/run-claude-code
+        with:
+          prompt: ${{ env.PROMPT }}
+          model_name: ${{ github.event.inputs.model_name }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+      - name: Run OpenCode to fix errors
+        if: github.event.inputs.github_actions_agent == 'open_code'
+        uses: ./.github/actions/run-opencode
+        with:
+          prompt: ${{ env.PROMPT }}
+          model_name: ${{ github.event.inputs.model_name }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASEURL: ${{ secrets.LANGFUSE_BASE_URL }}
+
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_VERSION: "2024-10-01-preview"
+
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Verify Evaluation Results
+        id: verify_results
+        continue-on-error: true
+        run: |
+          if find "$RESULTS_DIR" -type f -name "*.pdf" | read; then
+            echo "Evaluation results found."
+          else
+            echo "Evaluation results (figures) not found in $RESULTS_DIR. This attempt has failed."
+            exit 1
+          fi
+
+      - name: Commit and push evaluation results (on success)
+        if: steps.verify_results.outcome == 'success'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add "$RESULTS_DIR"
+          git add --update .
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Commit evaluation results (${{ env.RESULTS_DIR }}) using ${{ github.event.inputs.github_actions_agent }}"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "No changes were made by the agent or the evaluation."
+          fi
+
+      - name: Check retry limit
+        if: steps.verify_results.outcome == 'failure'
+        id: check-retry
+        run: |
+          RETRY_COUNT=${{ github.event.inputs.retry_count }}
+          MAX_RETRIES=5
+          
+          if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
+            echo "Max retries ($MAX_RETRIES) reached. Failing workflow."
+            echo "should_retry=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "Retry attempt $RETRY_COUNT of $MAX_RETRIES"
+            echo "should_retry=true" >> "$GITHUB_OUTPUT"
+            echo "next_retry=$((RETRY_COUNT + 1))" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Workflow Re-run (on failure)
+        if: steps.verify_results.outcome == 'failure' && steps.check-retry.outputs.should_retry == 'true'
+        run: |
+          echo "Retrying workflow due to evaluation failure (attempt ${{ steps.check-retry.outputs.next_retry }})."
+          gh workflow run "${{ github.workflow }}" --ref ${{ github.ref }} \
+            -f branch_name='${{ github.event.inputs.branch_name }}' \
+            -f run_ids='${{ github.event.inputs.run_ids }}' \
+            -f github_actions_agent='${{ github.event.inputs.github_actions_agent }}' \
+            -f model_name='${{ github.event.inputs.model_name }}' \
+            -f retry_count='${{ steps.check-retry.outputs.next_retry }}'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

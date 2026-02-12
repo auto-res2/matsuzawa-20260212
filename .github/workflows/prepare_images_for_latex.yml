@@ -1,0 +1,78 @@
+name: "Prepare Images for LaTeX"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+      subdir:
+        description: 'Subdirectory under .research/latex/ (e.g., iclr2025)'
+        required: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SOURCE_DIR: ".research/results"
+  TARGET_IMG_DIR: .research/latex/${{ github.event.inputs.subdir }}/images
+
+jobs:
+  prepare-images-for-latex:
+    name: Prepare images for LaTeX
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy experiment images to LaTeX directory
+        run: |
+          echo "Using source directory: $SOURCE_DIR"
+          echo "Target directory: $TARGET_IMG_DIR"
+
+          if [ ! -d "$SOURCE_DIR" ]; then
+            echo "Error: Source directory $SOURCE_DIR not found."
+            exit 1
+          fi
+
+          if [ ! -d "$TARGET_IMG_DIR" ]; then
+            echo "Note: Target directory does not exist yet. It will be created."
+          fi
+
+          mkdir -p "$TARGET_IMG_DIR"
+
+          echo "Copying PDF images from $SOURCE_DIR to $TARGET_IMG_DIR"
+
+
+          find "$SOURCE_DIR" -type f -name "*.pdf" \
+            -exec cp {} "$TARGET_IMG_DIR/" \;
+
+          echo "Image copy completed. Files in images/:"
+          ls -la "$TARGET_IMG_DIR/" || echo "No images present."
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add "$TARGET_IMG_DIR"
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Prepare experiment images for ${{ github.event.inputs.subdir }}"
+
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "No changes detected. Skipping commit."
+          fi

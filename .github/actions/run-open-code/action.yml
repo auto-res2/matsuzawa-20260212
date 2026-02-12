@@ -1,0 +1,145 @@
+name: "Run OpenCode"
+description: "Setup OpenCode, resolve LLM provider, and run opencode with retry"
+
+inputs:
+  model_name:
+    description: "Model name (e.g. openrouter/openai/gpt-5-nano)"
+    required: true
+  prompt:
+    description: "Prompt passed to opencode (ignored if prompt_file is provided)"
+    required: false
+  prompt_file:
+    description: "Path to file containing the prompt (alternative to prompt)"
+    required: false
+  max_retries:
+    description: 'Maximum number of retries'
+    required: false
+    default: '10'
+
+runs:
+  using: "composite"
+  steps:
+    # -----------------------------
+    # Runtime setup
+    # -----------------------------
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+
+    - name: Install bun
+      shell: bash
+      run: npm install -g bun
+
+    - name: Install OpenCode
+      shell: bash
+      run: |
+        set -e
+        for i in 1 2 3 4 5; do
+          if curl -fsSL https://opencode.ai/install | bash; then
+            break
+          fi
+          if [ "$i" -lt 5 ]; then
+            sleep $((2**i))
+          else
+            echo "::error::OpenCode install failed after $i attempts"
+            exit 1
+          fi
+        done
+        npm install opencode-plugin-langfuse
+
+    # -----------------------------
+    # Resolve LLM provider
+    # -----------------------------
+    - name: Resolve LLM provider and export env
+      shell: bash
+      run: |
+        set -e
+
+        MODEL="${{ inputs.model_name }}"
+        echo "Resolving provider for model: $MODEL"
+
+        case "$MODEL" in
+          openrouter/*)
+            echo "PROVIDER=openrouter" >> "$GITHUB_ENV"
+            echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}" >> "$GITHUB_ENV"
+            ;;
+
+          openai/*)
+            echo "PROVIDER=openai" >> "$GITHUB_ENV"
+            echo "OPENAI_API_KEY=${OPENAI_API_KEY}" >> "$GITHUB_ENV"
+            ;;
+
+          anthropic/*)
+            echo "PROVIDER=anthropic" >> "$GITHUB_ENV"
+            echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+            ;;
+
+          google/*)
+            echo "PROVIDER=google" >> "$GITHUB_ENV"
+            echo "GOOGLE_API_KEY=${GOOGLE_API_KEY}" >> "$GITHUB_ENV"
+            ;;
+
+          azure/*)
+            echo "PROVIDER=azure" >> "$GITHUB_ENV"
+            echo "AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}" >> "$GITHUB_ENV"
+            echo "AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}" >> "$GITHUB_ENV"
+            echo "AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2024-10-01-preview}" >> "$GITHUB_ENV"
+            ;;
+
+          bedrock/*)
+            echo "PROVIDER=bedrock" >> "$GITHUB_ENV"
+            echo "AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}" >> "$GITHUB_ENV"
+            echo "AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}" >> "$GITHUB_ENV"
+            echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}" >> "$GITHUB_ENV"
+            ;;
+
+          *)
+            echo "❌ Unsupported model_name: $MODEL"
+            exit 1
+            ;;
+        esac
+
+        echo "Resolved provider: $PROVIDER"
+
+    # -----------------------------
+    # Run OpenCode with retry
+    # -----------------------------
+
+    # NOTE: OpenCode's streaming output causes traces to be fragmented in Langfuse 
+    - name: Run OpenCode
+      shell: bash
+      run: |
+        set -e
+        
+        # Prepare prompt: reference file instead of embedding content
+        if [ -n "${{ inputs.prompt_file }}" ]; then
+          if [ ! -f "${{ inputs.prompt_file }}" ]; then
+            echo "::error::Prompt file not found: ${{ inputs.prompt_file }}"
+            exit 1
+          fi
+          echo "Using prompt file reference: ${{ inputs.prompt_file }}"
+          OPENCODE_PROMPT="Please read and execute the instructions in the file: ${{ inputs.prompt_file }}"
+        else
+          echo "Using inline prompt"
+          OPENCODE_PROMPT="${{ inputs.prompt }}"
+        fi
+        
+        MAX_RETRIES=${{ inputs.max_retries }}
+
+        for i in $(seq 1 "$MAX_RETRIES"); do
+          echo "OpenCode attempt $i/$MAX_RETRIES"
+          if opencode run --model "${{ inputs.model_name }}" "$OPENCODE_PROMPT"; then
+            echo "OpenCode succeeded"
+            exit 0
+          fi
+
+          if [ "$i" -lt "$MAX_RETRIES" ]; then
+            backoff=$((2**i))
+            echo "Attempt $i failed. Retrying in ${backoff}s..."
+            sleep "$backoff"
+          else
+            echo "::error::All $MAX_RETRIES OpenCode attempts failed"
+            exit 1
+          fi
+        done

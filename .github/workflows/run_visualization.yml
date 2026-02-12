@@ -1,0 +1,105 @@
+name: "Run Visualization"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+      run_ids:
+        description: 'A JSON array of run_ids to process'
+        required: true
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RESULTS_DIR: ".research/results"
+
+jobs:
+  run-visualization:
+    name: Run Visualization
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch_name }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+          enable-cache: false
+
+      - name: Prepare results dir
+        run: mkdir -p "$RESULTS_DIR"
+
+      - name: Run visualization
+        id: run-viz
+        continue-on-error: true
+        run: |
+          trap 'sleep 1' EXIT
+          (
+            set -e
+            set -o pipefail
+
+            echo "=== [UV SYNC] Start at $(date -u) ==="
+            uv sync
+            echo "=== [UV SYNC] Finished successfully at $(date -u) ==="
+
+            echo "=== [VISUALIZATION] Start at $(date -u) ==="
+            uv run python -u -m src.evaluate \
+              results_dir="$RESULTS_DIR" \
+              run_ids='${{ github.event.inputs.run_ids }}'
+            echo "=== [VISUALIZATION] PASSED at $(date -u) ==="
+          ) > >(tee -a "$RESULTS_DIR/stdout.txt") 2> >(tee -a "$RESULTS_DIR/stderr.txt" >&2)
+
+      - name: Check visualization results
+        id: check-result
+        run: |
+          if [[ "${{ steps.run-viz.outcome }}" == "success" ]] \
+            && find "$RESULTS_DIR" -type f \( -name "*.pdf" -o -name "*.png" \) | read; then
+            echo "Visualization results found."
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Visualization results missing or visualization failed."
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visualization-${{ github.run_id }}
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Commit and push visualization results
+        if: steps.check-result.outputs.passed == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add "$RESULTS_DIR"
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Commit visualization results (${{ env.RESULTS_DIR }})"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "No changes from visualization."
+          fi

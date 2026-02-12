@@ -1,0 +1,81 @@
+name: "Prepare Images for HTML"
+
+on:
+  workflow_dispatch:
+
+env:
+  RESULTS_DIR: ".research/results"
+
+jobs:
+  convert-and-upload:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+
+      - name: Install PDF to PNG tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+
+      - name: Convert PDFs to PNGs
+        run: |
+          set -e
+          tmp_dir="/tmp/output_images"
+          mkdir -p "$tmp_dir"
+
+          if [ ! -d "$RESULTS_DIR" ]; then
+            echo "Directory $RESULTS_DIR not found. No results to process."
+            exit 0
+          fi
+
+          echo "Looking for PDFs in $RESULTS_DIR recursively..."
+
+          find "$RESULTS_DIR" -type f -name "*.pdf" | while read pdf; do
+            name=$(basename "$pdf" .pdf)
+            echo "Converting $pdf to PNG..."
+            pdftoppm "$pdf" "$tmp_dir/${name}" -png
+          done
+
+          if ls "$tmp_dir"/*-1.png 1> /dev/null 2>&1; then
+            for png in "$tmp_dir"/*-1.png; do
+              base=$(basename "$png" -1.png)
+              mv "$png" "$tmp_dir/${base}.png"
+            done
+          fi
+
+      - name: Copy converted PNGs to gh-pages branch
+        run: |
+          if [ -z "$(ls -A /tmp/output_images/*.png 2>/dev/null)" ]; then
+            echo "No PNG images were generated."
+            exit 0
+          fi
+
+          git fetch origin gh-pages || git branch gh-pages
+          git checkout gh-pages
+
+          target_dir="branches/${{ github.ref_name }}/images"
+          mkdir -p "$target_dir"
+          cp /tmp/output_images/*.png "$target_dir"
+
+      - name: Commit and push to gh-pages
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add branches/
+
+          if ! git diff --staged --quiet; then
+            git commit -m "Upload PNGs from ${{ github.ref_name }}"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin main
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "No changes were made by the agent."
+          fi

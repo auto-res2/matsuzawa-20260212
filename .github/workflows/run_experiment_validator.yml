@@ -1,0 +1,255 @@
+name: "Run Experiment Validator"
+run-name: "🤖 Validator [${{ inputs.run_stage }}]: ${{ inputs.run_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (e.g., main)'
+        required: true
+        default: 'main'
+      run_id:
+        description: 'Run ID to fix'
+        required: false
+      workflow_run_id:
+        description: 'Workflow run ID for the results'
+        required: true
+      run_stage:
+        description: 'Which stage produced the artifact (sanity, pilot, main, visualization)'
+        required: true
+        type: choice
+        options:
+          - sanity
+          - pilot
+          - main
+          - visualization
+        default: 'sanity'
+      research_topic:
+        description: 'Research topic or area of focus'
+        required: true
+      research_hypothesis:
+        description: 'Research hypothesis (JSON/YAML text)'
+        required: true
+      experimental_design:
+        description: 'Experimental design (JSON/YAML text)'
+        required: true
+      wandb_config:
+        description: 'WandB config (JSON/YAML text: entity/project)'
+        required: true
+      github_actions_agent:
+        description: 'AI agent tool to use (claude_code or open_code)'
+        required: true
+        type: choice
+        options:
+          - claude_code
+          - open_code
+        default: 'claude_code'
+      model_name:
+        description: 'Model to use (for OpenCode: openrouter/openai/gpt-5-nano, for Claude Code: sonnet/opus/haiku)'
+        required: true
+        default: 'sonnet'
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RESULTS_DIR: ".research/results"
+
+jobs:
+  fix:
+    name: Validate and Fix Experiment
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: false
+          
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch_name }}
+
+      - name: Validate run_id for stage
+        run: |
+          if [ "${{ github.event.inputs.run_stage }}" != "visualization" ] && [ -z "${{ github.event.inputs.run_id }}" ]; then
+            echo "::error::run_id is required for stages other than visualization."
+            exit 1
+          fi
+
+      - name: Resolve artifact name
+        id: resolve-artifact
+        run: |
+          if [ "${{ github.event.inputs.run_stage }}" = "visualization" ]; then
+            echo "name=${{ github.event.inputs.run_stage }}-${{ github.event.inputs.workflow_run_id }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.event.inputs.run_stage }}-${{ github.event.inputs.workflow_run_id }}-${{ github.event.inputs.run_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download stage results
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.resolve-artifact.outputs.name }}
+          run-id: ${{ github.event.inputs.workflow_run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ${{ env.RESULTS_DIR }}
+
+      - name: Extract error summary
+        run: |
+          if [ -f "$RESULTS_DIR/stderr.txt" ]; then
+            echo "=== ERROR SUMMARY (Last 100 lines of stderr) ===" > "$RESULTS_DIR/error_summary.txt"
+            tail -n 100 "$RESULTS_DIR/stderr.txt" >> "$RESULTS_DIR/error_summary.txt"
+          fi
+
+          if [ -f "$RESULTS_DIR/stdout.txt" ]; then
+            echo -e "\n=== RELEVANT STDOUT (Error/Exception/Validation lines) ===" >> "$RESULTS_DIR/error_summary.txt"
+            grep -i -E "(error|exception|traceback|failed|fatal|sanity_validation)" "$RESULTS_DIR/stdout.txt" | tail -n 80 >> "$RESULTS_DIR/error_summary.txt" || echo "No error patterns found in stdout" >> "$RESULTS_DIR/error_summary.txt"
+          fi
+
+          cat "$RESULTS_DIR/error_summary.txt"
+
+      - name: Build validation prompt
+        id: build-prompt
+        env:
+          PROMPT_PATH: .github/prompts/run_experiment_validator.md
+          RUN_ID: ${{ github.event.inputs.run_id }}
+          STAGE: ${{ github.event.inputs.run_stage }}
+          RESEARCH_TOPIC: ${{ github.event.inputs.research_topic }}
+          RESEARCH_HYPOTHESIS: ${{ github.event.inputs.research_hypothesis }}
+          EXPERIMENTAL_DESIGN: ${{ github.event.inputs.experimental_design }}
+          WANDB_CONFIG: ${{ github.event.inputs.wandb_config }}
+          ERROR_SUMMARY_PATH: ${{ env.RESULTS_DIR }}/error_summary.txt
+        run: |
+          set -e
+          if [ ! -f "$PROMPT_PATH" ]; then
+            echo "::error::Prompt file not found: $PROMPT_PATH"
+            exit 1
+          fi
+          if [ ! -f "$ERROR_SUMMARY_PATH" ]; then
+            echo "::error::Error summary not found: $ERROR_SUMMARY_PATH"
+            exit 1
+          fi
+
+          PROMPT_FILE="/tmp/experiment_validator_prompt.txt"
+          {
+            cat "$PROMPT_PATH"
+            echo ""
+            echo "STAGE: $STAGE"
+            echo "RUN_ID: $RUN_ID"
+            echo "RESULTS_DIR: $RESULTS_DIR"
+            echo "research_topic:"
+            printf "%s\n" "$RESEARCH_TOPIC"
+            echo "research_hypothesis:"
+            printf "%s\n" "$RESEARCH_HYPOTHESIS"
+            echo "experimental_design:"
+            printf "%s\n" "$EXPERIMENTAL_DESIGN"
+            echo "wandb_config:"
+            printf "%s\n" "$WANDB_CONFIG"
+            echo "ERROR_SUMMARY:"
+            cat "$ERROR_SUMMARY_PATH"
+          } > "$PROMPT_FILE"
+
+          echo "prompt_file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+          echo "Prompt saved to: $PROMPT_FILE ($(wc -c < "$PROMPT_FILE") bytes)"
+
+      - name: Run Claude Code to validate and fix
+        if: github.event.inputs.github_actions_agent == 'claude_code'
+        uses: ./.github/actions/run-claude-code
+        with:
+          prompt_file: ${{ steps.build-prompt.outputs.prompt_file }}
+          model_name: ${{ github.event.inputs.model_name }}
+          allowed_tools: '*'
+          timeout_minutes: '10'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+
+      - name: Run OpenCode to validate and fix
+        if: github.event.inputs.github_actions_agent == 'open_code'
+        uses: ./.github/actions/run-open-code
+        with:
+          prompt_file: ${{ steps.build-prompt.outputs.prompt_file }}
+          model_name: ${{ github.event.inputs.model_name }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASEURL: ${{ secrets.LANGFUSE_BASE_URL }}
+
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_VERSION: "2024-10-01-preview"
+
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Determine validation action
+        id: validation-action
+        env:
+          RUN_ID: ${{ github.event.inputs.run_id }}
+          RUN_STAGE: ${{ github.event.inputs.run_stage }}
+          WORKFLOW_RUN_ID: ${{ github.event.inputs.workflow_run_id }}
+        run: |
+          ACTION="proceed"
+          if ! git diff --quiet; then
+            ACTION="retry"
+          fi
+
+          printf '{\n  "validation_action": "%s",\n  "run_id": "%s",\n  "run_stage": "%s",\n  "workflow_run_id": "%s"\n}\n' \
+            "$ACTION" "$RUN_ID" "$RUN_STAGE" "$WORKFLOW_RUN_ID" > "$RESULTS_DIR/validation_result.json"
+
+          echo "validation_action=$ACTION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload validation result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validator-${{ github.run_id }}-${{ github.event.inputs.run_id }}
+          path: ${{ env.RESULTS_DIR }}/validation_result.json
+
+      - name: Commit and push fix
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add config/ src/ pyproject.toml
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Validation fix for run_id=${{ github.event.inputs.run_id }} using ${{ github.event.inputs.github_actions_agent }}"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "AI agent made no changes to the code."
+          fi

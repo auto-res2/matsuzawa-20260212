@@ -1,0 +1,201 @@
+﻿name: "Compile LaTeX"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name for upload paper pdf (e.g., main)'
+        required: true
+        default: 'main'
+      subdir:
+        description: 'Subdirectory under .research/latex/ (e.g., iclr2025)'
+        required: true
+      paper_name:
+        description: 'Desired output PDF filename without extension (e.g., generated_paper)'
+        required: true
+        default: 'generated_paper'
+      github_actions_agent:                                                                                                              
+        description: 'AI agent tool to use (claude_code or open_code)'  
+        required: true
+        type: choice
+        options:
+          - claude_code
+          - open_code
+        default: 'claude_code'
+      model_name:
+        description: 'Model to use (for OpenCode: openrouter/openai/gpt-5-nano, for Claude Code: sonnet/opus/haiku)'
+        required: true
+        default: 'sonnet'
+      retry_count:
+        description: 'Current retry attempt (internal use)'
+        required: false
+        default: '0'
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  autonomous-latex-fix-and-compile:
+    name: Autonomous LaTeX Fix and Compile Cycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      LATEX_DIR: .research/latex/${{ github.event.inputs.subdir }}
+      CHKTEX_COMMAND: |
+        set -e
+        echo "=== [PHASE 1/2] Running ChkTeX... ==="
+        chktex -q main.tex
+      COMPILE_COMMAND: |
+        set -e
+        echo "=== [PHASE 2/2] Compiling LaTeX document... ==="
+        pdflatex -interaction=nonstopmode main.tex
+
+        if [ -f "main.aux" ]; then
+           bibtex main || echo "Bibtex warning ignored"
+        fi
+
+        pdflatex -interaction=nonstopmode main.tex
+        pdflatex -interaction=nonstopmode main.tex
+      PROMPT: |
+        You are a fully autonomous AI assistant specializing in LaTeX document correction.
+        Your task is to ensure the LaTeX paper is free of chktex warnings and compiles successfully into a PDF. You will achieve this by executing, analyzing, fixing, and re-validating the document.
+        You have been granted full tool access.
+
+        Guiding Principles:
+        - Scope: Do not perform any Git operations like commit or push. Your sole responsibility is to make the LaTeX document compilable.
+        - Method: When fixing errors, you MUST only modify existing files. Do not create new files.
+        - Minimal Edits: You MUST limit your changes to the absolute minimum required to fix LaTeX syntax, chktex warnings, or compilation errors.
+        - Autonomy: Execute all steps autonomously without asking for permission.
+
+        Procedure:
+        1.  Change Directory: First, change your working directory to `$LATEX_DIR`. All subsequent commands MUST be run from this directory.
+        2.  Run ChkTeX: Execute the command `bash -c "$CHKTEX_COMMAND"`.
+        3.  Analyze & Fix ChkTeX: If the command fails, you MUST analyze the chktex warnings from the output, fix the `main.tex` file, and repeat step 2 until it passes.
+        4.  Run LaTeX Compile: Once chktex passes, execute `bash -c "$COMPILE_COMMAND"`.
+        5.  Analyze & Fix Compilation: If compilation fails, you MUST analyze the LaTeX errors (e.g., undefined control sequences, missing files, bad boxes), fix the `.tex` files, and repeat step 4 until it succeeds.
+        6.  Completion: Once both phases are complete, the task is finished.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install LaTeX, ChkTeX, and other dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            chktex \
+            texlive-base \
+            texlive-latex-recommended \
+            texlive-fonts-recommended \
+            texlive-latex-extra \
+            texlive-science
+
+      - name: Run Claude Code to fix errors
+        if: github.event.inputs.github_actions_agent == 'claude_code'
+        uses: ./.github/actions/run-claude-code
+        with:
+          prompt: ${{ env.PROMPT }}
+          model_name: ${{ github.event.inputs.model_name }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Run OpenCode to fix errors
+        if: github.event.inputs.github_actions_agent == 'open_code'
+        uses: ./.github/actions/run-open-code
+        with:
+          prompt: ${{ env.PROMPT }}
+          model_name: ${{ github.event.inputs.model_name }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_BASEURL: ${{ secrets.LANGFUSE_BASE_URL }}
+
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_API_VERSION: "2024-10-01-preview"
+
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Verify and Move compiled PDF
+        id: verify_pdf
+        continue-on-error: true
+        run: |
+          src="${LATEX_DIR}/main.pdf"
+          dest=".research/${{ github.event.inputs.paper_name }}.pdf"
+
+          if [ -f "$src" ]; then
+            mv "$src" "$dest"
+            echo "Successfully moved compiled PDF to $dest"
+          else
+            echo "Warning: Compiled PDF not found at $src"
+            exit 1
+          fi
+
+      - name: Commit and push LaTeX outputs (on success)
+        if: steps.verify_pdf.outcome == 'success'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git add .
+
+          if ! git diff --staged --quiet; then
+            git commit -m "[CI] Autonomous LaTeX fixes and compilation for ${{ github.event.inputs.subdir }} using ${{ github.event.inputs.github_actions_agent }}"
+            for i in {1..5}; do
+              git pull --rebase -X theirs origin ${{ github.event.inputs.branch_name }}
+              git push && break
+              echo "Push failed on attempt $i. Retrying in $((2**i)) seconds..."
+              sleep $((2**i))
+            done
+          else
+            echo "No changes were made by the agent."
+          fi
+
+      - name: Check retry limit
+        if: steps.verify_pdf.outcome == 'failure'
+        id: check-retry
+        run: |
+          RETRY_COUNT=${{ github.event.inputs.retry_count }}
+          MAX_RETRIES=5
+          
+          if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
+            echo "Max retries ($MAX_RETRIES) reached. Failing workflow."
+            echo "should_retry=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          else
+            echo "Retry attempt $RETRY_COUNT of $MAX_RETRIES"
+            echo "should_retry=true" >> "$GITHUB_OUTPUT"
+            echo "next_retry=$((RETRY_COUNT + 1))" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trigger Workflow Re-run (on failure)
+        if: steps.verify_pdf.outcome == 'failure' && steps.check-retry.outputs.should_retry == 'true'
+        run: |
+          echo "Retrying workflow due to compilation failure (attempt ${{ steps.check-retry.outputs.next_retry }})."
+          gh workflow run "${{ github.workflow }}" --ref ${{ github.ref }} \
+            -f branch_name='${{ github.event.inputs.branch_name }}' \
+            -f subdir='${{ github.event.inputs.subdir }}' \
+            -f paper_name='${{ github.event.inputs.paper_name }}' \
+            -f github_actions_agent='${{ github.event.inputs.github_actions_agent }}' \
+            -f model_name='${{ github.event.inputs.model_name }}' \
+            -f retry_count='${{ steps.check-retry.outputs.next_retry }}'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

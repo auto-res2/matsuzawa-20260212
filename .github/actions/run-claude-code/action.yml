@@ -1,0 +1,57 @@
+name: 'Run Claude Code'
+description: 'Execute Claude Code with specified model and prompt'
+
+inputs:
+  prompt:
+    description: 'Prompt to pass to Claude Code (ignored if prompt_file is provided)'
+    required: false
+  prompt_file:
+    description: 'Path to file containing the prompt (alternative to prompt)'
+    required: false
+  model_name:
+    description: 'Claude model to use (sonnet, opus, haiku)'
+    required: false
+    default: "claude-sonnet-4-5-20250929"
+  max_turns:
+    description: 'Maximum number of turns'
+    required: false
+    default: '100'
+  allowed_tools:
+    description: 'Comma-separated list of allowed tools'
+    required: false
+    default: 'Bash,Write,Edit,MultiEdit,TodoWrite'
+  timeout_minutes:
+    description: 'Timeout in minutes for Claude Code execution'
+    required: false
+    default: '20'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare prompt
+      shell: bash
+      run: |
+        if [ -n "${{ inputs.prompt_file }}" ]; then
+          if [ ! -f "${{ inputs.prompt_file }}" ]; then
+            echo "::error::Prompt file not found: ${{ inputs.prompt_file }}"
+            exit 1
+          fi
+          echo "Using prompt file reference: ${{ inputs.prompt_file }}"
+          echo "CLAUDE_PROMPT<<EOF" >> $GITHUB_ENV
+          echo "Please read and execute the instructions in the file: ${{ inputs.prompt_file }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        else
+          echo "Using inline prompt"
+          echo "CLAUDE_PROMPT<<EOF" >> $GITHUB_ENV
+          echo "${{ inputs.prompt }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        fi
+    
+    - name: Execute Claude Code
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      with:
+        anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+        prompt: ${{ env.CLAUDE_PROMPT }}
+        allowed_bots: '*' 
+        claude_args: "--model=${{ inputs.model_name }} --max-turns=${{ inputs.max_turns }} --allowed-tools ${{ inputs.allowed_tools }}"
